@@ -47,13 +47,14 @@ test('listSessions posts the JSON-RPC envelope, sorts by updatedAt desc and retu
     },
   });
 
-  assert.strictEqual(capturedUrl, BASE_URL + '/api/session.list');
+  assert.strictEqual(capturedUrl, BASE_URL + '/api/session/list');
   assert.strictEqual(capturedInit.method, 'POST');
   assert.strictEqual(capturedInit.headers['content-type'], 'application/json');
   const request = JSON.parse(capturedInit.body);
   assert.strictEqual(request.type, 'client-request');
-  assert.strictEqual(request.method, 'session.list');
-  assert.deepStrictEqual(request.payload, {});
+  assert.strictEqual(request.method, 'session/list');
+  // typert quirk: only session/list carries its reserved empty request under `_request`.
+  assert.deepStrictEqual(request.payload, { args: { _request: {} } });
   assert.ok(typeof request.rpcId === 'string' && request.rpcId.length > 0, 'rpcId must be a non-empty string');
 
   assert.deepStrictEqual(result.map((item) => item.sessionId), ['newer', 'middle', 'older']);
@@ -172,9 +173,9 @@ test('createSession posts session.create, returns sessionId and includes cwd whe
   });
 
   assert.strictEqual(sessionId, 's1');
-  assert.strictEqual(capturedUrl, BASE_URL + '/api/session.create');
-  assert.strictEqual(capturedBody.method, 'session.create');
-  assert.deepStrictEqual(capturedBody.payload, { cwd: 'D:\\workspace' });
+  assert.strictEqual(capturedUrl, BASE_URL + '/api/session/create');
+  assert.strictEqual(capturedBody.method, 'session/create');
+  assert.deepStrictEqual(capturedBody.payload, { args: { request: { cwd: 'D:\\workspace' } } });
 });
 
 test('createSession posts workspaceId when provided and never mixes in cwd', async () => {
@@ -189,8 +190,8 @@ test('createSession posts workspaceId when provided and never mixes in cwd', asy
   });
 
   assert.strictEqual(sessionId, 's-ws');
-  assert.strictEqual(capturedBody.method, 'session.create');
-  assert.deepStrictEqual(capturedBody.payload, { workspaceId: 'w-1' });
+  assert.strictEqual(capturedBody.method, 'session/create');
+  assert.deepStrictEqual(capturedBody.payload, { args: { request: { workspaceId: 'w-1' } } });
 });
 
 test('createSession omits cwd from the payload when it is empty or not a string', async () => {
@@ -204,7 +205,7 @@ test('createSession omits cwd from the payload when it is empty or not a string'
       },
     });
     assert.strictEqual(sessionId, 's2');
-    assert.deepStrictEqual(capturedBody.payload, {});
+    assert.deepStrictEqual(capturedBody.payload, { args: { request: {} } });
   }
 });
 
@@ -251,7 +252,7 @@ test('ensureWorkspaceSession reuses a blank root session for the same cwd', asyn
 
   assert.strictEqual(sessionId, 'blank-1');
   assert.deepStrictEqual(calls, [
-    { url: BASE_URL + '/api/session.list', method: 'session.list' },
+    { url: BASE_URL + '/api/session/list', method: 'session/list' },
   ]);
 });
 
@@ -261,7 +262,7 @@ test('ensureWorkspaceSession creates a session when no blank root session matche
     fetchImpl: async (url, init) => {
       const request = JSON.parse(init.body);
       calls.push(request.method);
-      if (request.method === 'session.list') {
+      if (request.method === 'session/list') {
         return jsonResponse(200, {
           result: {
             ok: true,
@@ -269,12 +270,15 @@ test('ensureWorkspaceSession creates a session when no blank root session matche
           },
         });
       }
-      return jsonResponse(200, { result: { ok: true, value: { sessionId: 'created-1' } } });
+      if (request.method === 'session/create') {
+        return jsonResponse(200, { result: { ok: true, value: { sessionId: 'created-1' } } });
+      }
+      throw new Error('Unexpected method: ' + request.method);
     },
   });
 
   assert.strictEqual(sessionId, 'created-1');
-  assert.deepStrictEqual(calls, ['session.list', 'session.create']);
+  assert.deepStrictEqual(calls, ['session/list', 'session/create']);
 });
 
 test('ensureWorkspaceSession returns null for empty or non-string cwd', async () => {

@@ -32,6 +32,7 @@ const { ensureManagedRuntime } = require("./runtimeProvisioner");
 const { resolveLocalDshRuntime } = require("./localRuntimeResolver");
 const { normalizeLaunchMethod, resolveCommandRuntime } = require("./launchMethodResolver");
 const { discoverDshWebPorts: defaultDiscoverDshWebPorts } = require("./processDiscovery");
+const { detectRuntimeEnvironment, resolveSharedEndpointPort, SHARE_MODES } = require("./runtimeEnvironment");
 const { isRetryableStartupError, renderStartupError } = require("./startupErrors");
 const { deriveVscodeCapabilities } = require("./vscodeCapabilities");
 const { deriveFeatureFlags, deriveRuntimeIssues } = require("./dshCompat");
@@ -210,6 +211,7 @@ let ownerWindowId = null; // stable window identity (vscode.env.windowId or deri
 let heartbeatFilePath = null; // per-window heartbeat path injected via DSH_VSCODE_HEARTBEAT_PATH
 let heartbeatTimer = null; // 10s heartbeat writer
 let ownerStartTs = null; // extension-host process start timestamp (PID-reuse guard)
+let runtimeEnvironment = null; // OS environment of this extension host: windows / wsl / linux / other
 
 async function waitForResolvedView(timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
@@ -730,14 +732,58 @@ function renderFrame(context) {
 }
 
 /**
- * Stop the manager-owned child, if any, so a reused external instance is
- * NEVER killed — mirroring the exact rule the
- * `dsh.stopServer` command and the close policy rely on. Safe no-op when
- * there is nothing owned.
+ * Resolve the effective DSH endpoint port for this window's environment.
+ *
+ * Shared-instance mode (`dsh.share.mode = "environment"`, the default)
+ * converges every window of one OS environment onto one instance: a WSL
+ * extension host that has not explicitly pinned `dsh.port` uses its own
+ * default port (3081) so WSL2 localhost forwarding can never make a Windows
+ * window adopt the WSL instance (or vice versa). Everything else — an
+ * explicit port, window mode, user-managed mode, non-WSL environments —
+ * keeps the configured port verbatim.
+ */
+function resolveEndpointPort(cfg) {
+  return resolveSharedEndpointPort({
+    port: cfg.port,
+    portExplicit: cfg.portExplicitlySet,
+    shareMode: cfg.shareMode,
+    autoStart: cfg.autoStart,
+    environment: runtimeEnvironment,
+  });
+}
+
+/**
+ * True when the owned child is currently adopted by another live window.
+ * Advisory: injected/fake managers without the method (older seams) and any
+ * registry error resolve to false so the legacy stop behavior stands.
+ */
+async function ownedChildKeptForAdopters() {
+  try {
+    if (!manager || typeof manager.ownedChildHasLiveAdopters !== 'function') return false;
+    return await manager.ownedChildHasLiveAdopters(hostContext.registryFilePath());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop the owned DSH child. In shared-instance mode other windows may have
+ * adopted this instance; unless `force` is set (explicit user command, or a
+ * restart that must replace the child), the stop is skipped while any
+ * adopting window's extension host is still alive — the activation sweep
+ * reclaims the instance once the owner AND every attacher are gone.
+ * Safe no-op when there is nothing owned.
+ * @param {{force?: boolean}} [options] - force bypasses adopter protection.
  * @returns {Promise<boolean>} true when an owned server was stopped.
  */
-async function stopOwnedServer() {
+async function stopOwnedServer({ force = false } = {}) {
   if (!manager || !manager.hasOwnedChild()) return false;
+  if (!force && await ownedChildKeptForAdopters()) {
+    appendDiagnostic(loc(
+      "Shared DSH instance left running: other window(s) still attached."
+    ));
+    return false;
+  }
   await manager.stop();
   return true;
 }
@@ -900,20 +946,24 @@ async function connectNow(context) {
           }
         }
       } catch (runtimeError) {
+        const endpointPort = resolveEndpointPort(cfg);
+        const adoptOptions = { registryFile: hostContext.registryFilePath() };
         let adopted = typeof manager.adoptRunningDsh === 'function'
-          ? await manager.adoptRunningDsh(cfg.host, cfg.port).catch(() => null)
+          ? await manager.adoptRunningDsh(cfg.host, endpointPort, adoptOptions).catch(() => null)
           : null;
         if (!adopted) {
           // Process-discovery fallback (credited to DM010727/dsh-cline): the
           // configured port is silent but a `dsh web` may be running on a
-          // different port of this machine (leftover instance, a port override
-          // in another window, a manual terminal session). Scan process
-          // command lines, then probe each discovered port before giving up.
+          // different port of this environment (leftover instance, a port
+          // override in another window, a manual terminal session). Scan
+          // process command lines — the OS only sees its own processes, which
+          // keeps the Windows and WSL namespaces apart — then probe each
+          // discovered port before giving up.
           try {
             const ports = await discoverRunningDshWebPorts({ platform: process.platform });
             for (const port of ports) {
-              if (port === cfg.port) continue;
-              adopted = await manager.adoptRunningDsh(cfg.host, port);
+              if (port === endpointPort) continue;
+              adopted = await manager.adoptRunningDsh(cfg.host, port, adoptOptions);
               if (adopted) break;
             }
           } catch {
@@ -937,10 +987,12 @@ async function connectNow(context) {
     if (server === null) {
       server = await manager.ensureServer({
         host: cfg.host,
-        port: cfg.port,
+        port: resolveEndpointPort(cfg),
         autoStart: cfg.autoStart,
         cwd,
         registryFile: hostContext.registryFilePath(),
+        shareMode: cfg.shareMode,
+        discoverDshWebPorts: discoverRunningDshWebPorts,
       });
     }
     await bindServer(context, server, cwd);
@@ -950,7 +1002,7 @@ async function connectNow(context) {
     if (lifecycle.stopped) return;
     setStatusBar("$(error) " + loc("DSH: unavailable"));
     const cfg = hostContext.config();
-    const url = "http://" + cfg.host + ":" + cfg.port;
+    const url = "http://" + cfg.host + ":" + resolveEndpointPort(cfg);
     currentExternalUrl = safeHttpUrl(url) === "about:blank" ? null : await externalize(url);
     const cleanEligible = isCleanRestartEligible(err);
     pendingCleanRestart = cleanEligible;
@@ -998,7 +1050,7 @@ async function reconnectNow(context) {
     });
     return;
   }
-  await stopOwnedServer();
+  await stopOwnedServer({ force: true }); // restart must replace the child even when other windows adopted it
   currentServer = null;
   currentExternalUrl = null;
   currentSessionId = null;
@@ -1499,7 +1551,15 @@ async function setupCoreServer({ context, services }) {
       [WATCHDOG_ENV.WINDOW_ID]: ownerWindowId,
       [WATCHDOG_ENV.HEARTBEAT_PATH]: heartbeatFilePath,
     };
-    if (hostContext.config().closePolicy === CLOSE_POLICIES.NEVER) {
+    // Watchdog off when the instance is meant to outlive its spawning window:
+    // `never` close policy (explicit user-managed operation) and shared-
+    // instance mode, where the owner window exiting must not kill the child
+    // other windows adopted. The registry sweep (owner dead AND no live
+    // attachers) reclaims such instances instead.
+    if (
+      hostContext.config().closePolicy === CLOSE_POLICIES.NEVER
+      || hostContext.config().shareMode === SHARE_MODES.ENVIRONMENT
+    ) {
       watchdogEnv[WATCHDOG_ENV.WATCHDOG] = 'off';
     }
     services.manager?.setSpawnEnv?.(watchdogEnv);
@@ -1531,6 +1591,7 @@ async function setupCoreServer({ context, services }) {
         e.affectsConfiguration("dsh.port") ||
         e.affectsConfiguration("dsh.autoStart") ||
         e.affectsConfiguration("dsh.closePolicy") ||
+        e.affectsConfiguration("dsh.share.mode") ||
         e.affectsConfiguration("dsh.runtime.manifestUrl") ||
         e.affectsConfiguration("dsh.runtime.version") ||
         e.affectsConfiguration("dsh.local.packageRoot") ||
@@ -1689,8 +1750,9 @@ async function setupCoreSidebar({ context, services }) {
   };
   services.changeTracker = changeTracker;
   // C2.5 event-flow attribution: project edit/write tool calls from the DSH
-  // session event stream (bounded export back-scan + live events.mux
-  // subscription) into the change journal. Zero interception: the journal's
+  // session event stream (follow snapshot `records` backfill + live
+  // /api/remote.mux subscription) into the change journal. Zero interception:
+  // the journal's
   // (path, sessionId, ±2s) idempotent merge folds duplicates with C2 bridge
   // notifications. Every projector failure only logs via appendDiagnostic.
   try {
@@ -2458,11 +2520,13 @@ function registerFeatureCommands(context, featureOk) {
       // Stops ONLY a process this extension instance spawned and owns. A
       // reused external server (found already running and adopted) is never
       // killed — the pure decision function is self-tested in serverManager.js.
+      // The explicit command is forced: the user asked for this process to
+      // stop even when other windows adopted it in shared mode.
         if (!manager.hasOwnedChild()) {
           vscode.window.showInformationMessage(loc("No DSH server is owned by this extension"));
           return;
         }
-        await stopOwnedServer();
+        await stopOwnedServer({ force: true });
         currentServer = null;
         currentExternalUrl = null;
         currentSessionId = null;
@@ -2887,6 +2951,7 @@ async function activateWithDependencies(context, dependencies = {}) {
   // timer, owner identity or channel.
   stopHeartbeat();
   ownerWindowId = null;
+  runtimeEnvironment = null;
   heartbeatFilePath = null;
   ownerStartTs = null;
   outputChannel = null;
@@ -2897,6 +2962,10 @@ async function activateWithDependencies(context, dependencies = {}) {
   ownerWindowId = deriveWindowId(vscode);
   heartbeatFilePath = heartbeatPathFor(context, ownerWindowId);
   startHeartbeat();
+  // Shared-instance mode: classify this extension host's OS environment once
+  // per activation (Windows window vs Remote-WSL window). Every connect pass
+  // resolves its effective endpoint from this value.
+  runtimeEnvironment = detectRuntimeEnvironment();
 
   // C1 activation scan (early, before L0): sweep registry entries left by
   // dead owner Windows. Never kills a live owner's child; a sweep failure
@@ -3043,6 +3112,14 @@ async function deactivate() {
   lifecycle?.stopAccepting?.();
   runtimeAbort?.abort?.(); // cancel only in-flight provisioning; never touches a ready owned child
   viewGeneration += 1;
+  // Shared-instance bookkeeping: drop this window's attacher record first so
+  // our own exit never counts as a live adopter of someone else's instance.
+  try {
+    ServerManager.removeAdopterFromRegistry(hostContext.registryFilePath(), {
+      vscodePid: process.pid,
+      windowId: ownerWindowId,
+    });
+  } catch { /* best-effort bookkeeping */ }
   try {
     if (!manager) return undefined;
     if (normalizeClosePolicy(hostContext.config().closePolicy) === CLOSE_POLICIES.NEVER) {
@@ -3053,13 +3130,22 @@ async function deactivate() {
     // Prevent probe/port-scan work from spawning after shutdown begins. If a
     // child already exists, stopping it also makes an in-flight health wait
     // settle promptly instead of delaying deactivation for the full timeout.
+    // Shared-instance exception: when other windows adopted our child, leave
+    // it running for them — the activation sweep reclaims it once the owner
+    // AND every attacher extension host is gone.
     manager.cancelPending();
     if (manager.hasOwnedChild()) {
-      await manager.stop();
+      if (await ownedChildKeptForAdopters()) {
+        appendDiagnostic(loc("Shared DSH instance left running: other window(s) still attached."));
+      } else {
+        await manager.stop();
+      }
     }
     await lifecycle.wait();
     if (manager.hasOwnedChild()) {
-      await manager.stop();
+      if (!(await ownedChildKeptForAdopters())) {
+        await manager.stop();
+      }
     }
     return undefined;
   } finally {

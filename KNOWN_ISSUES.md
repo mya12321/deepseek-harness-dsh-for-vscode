@@ -1,7 +1,16 @@
 # Known Issues / 问题记录
 
-> 更新日期：2026-09-04 · 对应版本：**1.1.2** · 当前**无未修复已知问题**
-> Updated 2026-09-04 · tracks release **1.1.2** · **no open known issues**
+> 更新日期：2026-09-17 · 对应版本：**1.2.0（开发中）** · 当前**1 个未修复已知问题（独立跟进项）**
+> Updated 2026-09-17 · tracks in-development **1.2.0** · **1 open issue (separate follow-up)**
+
+迁移说明：1.2.0 已把扩展迁移到 dsh ≥ 0.1.3-alpha.2 的 typert 线上协议（实测 0.1.5）——斜杠式 JSON-RPC + `/api/remote.mux` WebSocket，旧式 `session.list` / `workspace.list` / `events.mux` / `session.export` 端点全部移除、无降级（见 [CHANGELOG.md](CHANGELOG.md)）。`session/prompt` 请求 id 改为客户端生成；会话回填改走 follow 快照的 `records`。
+Migration note: 1.2.0 hardcodes the typert wire protocol (dsh ≥ 0.1.3-alpha.2, tested on 0.1.5) — slashed JSON-RPC plus `/api/remote.mux` WebSocket; the legacy `session.list` / `workspace.list` / `events.mux` / `session.export` endpoints are gone with no fallback. `session/prompt` request ids are client-minted and the changes-view backfill reads the follow snapshot's `records`.
+
+## 未修复已知问题 / Open issue
+
+| # | 问题 / Issue | 状态 / Status |
+|---|---|---|
+| 1 | `runtime-integration/dsh-vscode-integration` 插件的桥接端点（`/api/lm/*`、`/api/fim`、`/api/vscode/open-link`）在 dsh 0.1.5 上返回 404（这些端点仍是旧协议遗留，未随 typert 迁移）→ LM 路由 / Tab 补全 / 打开链接等插件侧能力不可用。**独立跟进项**，不属于本次 404 迁移范围。 / The plugin's bridge endpoints (`/api/lm/*`, `/api/fim`, `/api/vscode/open-link`) still 404 on dsh 0.1.5 — they predate the typert migration on the plugin side, so LM routing / tab completion / open-link are unavailable. Separate follow-up, out of scope for this 404 migration. | 跟进中 / in progress |
 
 历史问题与修复索引（复现细节见 [CHANGELOG.md](CHANGELOG.md) 与 [docs/dev/](docs/dev/)）：
 Past issues and their fixes (details in the changelog and dev notes):

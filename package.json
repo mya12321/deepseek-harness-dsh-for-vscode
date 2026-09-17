@@ -2,7 +2,7 @@
 	"name": "dsh-vs-sidebar",
 	"displayName": "%dsh.displayName%",
 	"description": "%dsh.ext.description%",
-	"version": "1.1.3",
+	"version": "1.2.0",
 	"publisher": "Xizhi1024",
 	"license": "MIT",
 	"pricing": "Free",
@@ -465,6 +465,16 @@
 					],
 					"default": "onVscodeExit",
 					"description": "%dsh.cfg.closePolicy%"
+				},
+				"dsh.share.mode": {
+					"type": "string",
+					"enum": [
+						"environment",
+						"window"
+					],
+					"default": "environment",
+					"scope": "machine",
+					"description": "%dsh.cfg.share.mode%"
 				},
 				"dsh.local.packageRoot": {
 					"type": "string",

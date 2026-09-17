@@ -3,6 +3,18 @@
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 All notable changes to this project are documented here, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added / 新增
+
+- **跨窗口共享 DSH 实例（`dsh.share.mode = "environment"`，新默认）**：同一 OS 环境的所有 VS Code 窗口收敛到**一个** DSH 实例——第一个窗口启动（持有所有权），其余窗口经配置端口探测或本环境 `dsh web` 进程扫描**收养**该实例（永不停止）；实例在仍有窗口附着时保持运行，属主退出不再杀进程，激活期孤儿清理只在属主与全部附着窗口都退出后回收。**Windows 与 WSL 天然隔离**：探测/扫描都以扩展宿主所在 OS 为界；未显式设置 `dsh.port` 的 WSL 窗口使用默认端口 3081，避免 WSL2 localhost 转发导致跨环境误收养（显式端口与用户自管模式仍按原值）。共享模式下 DSH 侧 watchdog 关闭（实例必须活得比启动窗口久）；注册表新增 attachers 记录驱动收养保护与清理判定；`dsh.stopServer` / 重启为强制停止，关闭视图与 VS Code 退出尊重收养保护。`window`（旧值）保持每窗口一实例的旧行为。
+  Cross-window shared DSH instance (`dsh.share.mode = "environment"`, the new default): every VS Code window of one OS environment converges on ONE instance — the first window starts it (owned), the rest adopt it via the configured-port probe or this environment's own `dsh web` process scan and never stop it; the instance survives its spawning window's exit, and the activation sweep reclaims it only after the owner AND every attached window are gone. Windows and WSL stay separate: probing and process discovery are scoped to the extension host's OS, and a WSL window without an explicit `dsh.port` uses its own default port 3081 so WSL2 localhost forwarding cannot cross-adopt (explicit ports and user-managed mode are honored verbatim). The DSH-side watchdog is off in shared mode; the instance registry gains attacher records that drive adopter-aware exits; `dsh.stopServer` and restarts force-stop, while view close and VS Code exit respect the protection. `window` keeps the legacy per-window behavior.
+
+### Changed / 变更
+
+- **迁移到 typert 线上协议（dsh ≥ 0.1.3-alpha.2，实测 0.1.5）**：硬编码 dsh 新版网关协议，不再做旧协议兼容。所有 HTTP 调用改为斜杠式 JSON-RPC（`POST /api/session/list`、`/api/session/create`、`/api/session/rename`、`/api/workspace/create`、`/api/workspace/delete`），事件流全部改走 `/api/remote.mux` WebSocket（内置零依赖 RFC6455 客户端）。会话跟随（@dsh 实时文本、DSH Changes 工具归因回填）改由 WS「快照 + 事件帧」承载；`session/prompt` 的请求 id 改为客户端生成（`crypto.randomUUID()`）；变更树回填从 `session.export` ZIP 细读改为 follow 快照的 `records` 尾部。**移除且无降级兜底**的旧端点：`session.list` / `workspace.list` / `events.mux` / `session.export` ——低于 0.1.3-alpha.2 的 dsh 无法与此扩展协同工作。
+  Migrated to the typert wire protocol (dsh ≥ 0.1.3-alpha.2, tested on 0.1.5), hardcoded with no legacy fallback: every HTTP call is now slashed JSON-RPC (`POST /api/session/list`, `/api/session/create`, `/api/session/rename`, `/api/workspace/create`, `/api/workspace/delete`) and every event stream rides a WebSocket on `/api/remote.mux` (zero-dependency hand-rolled RFC6455 client). Session follow (live @dsh text, changes-view tool attribution) works off WS snapshot + event frames, `session/prompt` request ids are client-minted (`crypto.randomUUID()`), and the changes-view backfill reads the follow snapshot's `records` tail instead of the `session.export` ZIP. **Removed with no fallback:** `session.list` / `workspace.list` / `events.mux` / `session.export` — dsh builds below 0.1.3-alpha.2 cannot work with this extension.
+
 ## [1.1.3] - 2026-09-04
 
 ### Fixed / 修复

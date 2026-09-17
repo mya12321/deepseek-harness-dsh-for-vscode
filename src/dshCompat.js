@@ -20,10 +20,15 @@ const THEME_PARAM_MIN = "0.1.0";
 const TOOLS_V3_MIN = "0.1.0";
 
 /**
- * Oldest DSH runtime this extension supports (the --no-open spawn floor;
- * older runtimes exit before the health probe runs). @type {string}
+ * Oldest DSH runtime this extension supports — the typert wire protocol
+ * floor: dsh ≥ 0.1.3-alpha.2 speaks slashed JSON-RPC (`/api/session/list`,
+ * …) and WebSocket streams (`/api/remote.mux`); older runtimes 404 every
+ * session/workspace call because the legacy dotted endpoints were removed
+ * with no fallback. (A lower --no-open spawn floor still exists at
+ * 0.1.0-rc.7 in managedRuntimeLaunch, but it is not a support floor.)
+ * @type {string}
  */
-const SUPPORTED_DSH_MIN = "0.1.0-rc.7";
+const SUPPORTED_DSH_MIN = "0.1.3-alpha.2";
 
 /**
  * First DSH runtime whose per-session projection cache seeds cold

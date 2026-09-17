@@ -10,8 +10,18 @@
  *   - start one window-owned DSH instance via an already verified managed
  *     runtime on a free port (scanning forward from the configured port), or
  *     reuse a user-managed instance only when autoStart is disabled.
+ *   - in environment-shared mode (`dsh.share.mode = "environment"`, the
+ *     extension default) converge every window of one OS environment
+ *     (Windows vs WSL) onto ONE instance: adopt whatever already answers as
+ *     DSH — on the configured port or discovered from this environment's own
+ *     `dsh web` processes — and spawn only when nothing answers, with one
+ *     adoption retry to settle a simultaneous-start race.
  *   - keep a JSON instance registry for stale-entry cleanup and diagnostics;
  *     live entries from other VS Code windows are never adopted by default.
+ *     In shared mode the registry additionally records which windows
+ *     (attachers) adopted an instance so the spawning window's exit path can
+ *     leave it running for the remaining windows, and the activation sweep
+ *     reclaims it only once the owner AND every attacher are gone.
  *   - report lifecycle transitions through an `onStatus` callback.
  *
  * Zero external dependencies: only Node built-ins are used.
@@ -29,6 +39,7 @@ const {
 } = require('./managedRuntimeLaunch');
 const { STARTUP_ERRORS } = require('./startupErrors');
 const { tokenFromUrl } = require('./dshWebAuth');
+const { SHARE_MODES } = require('./runtimeEnvironment');
 
 // Shared contract constants normally come from ./types. Fall back to local
 // defaults so this file stays independently testable when copied in isolation.
@@ -506,24 +517,42 @@ class ServerManager {
   /**
    * Try to adopt a DSH instance that is already serving `host:port`.
    *
-   * Unlike ensureServer()'s default autoStart path this is an explicit
-   * caller-requested fallback: it never spawns and never kills anything. It
-   * returns a non-owned reuse handle when the endpoint answers as DSH, or
-   * null when the endpoint is unreachable / non-DSH / probing fails.
-   * Status is emitted through the same lifecycle channel as ensureServer().
+   * Unlike ensureServer()'s legacy window-owned path this is an explicit
+   * caller-requested fallback (or the shared-mode adoption step): it never
+   * spawns and never kills anything. It returns a non-owned reuse handle
+   * when the endpoint answers as DSH, or null when the endpoint is
+   * unreachable / non-DSH / probing fails. Status is emitted through the
+   * same lifecycle channel as ensureServer().
+   *
+   * When `options.registryFile` is given and this manager carries an owner
+   * identity, the adoption is recorded in the registry entry of the adopted
+   * instance (attachers list) — the spawning window's exit path and the
+   * activation sweep read that list to keep a shared instance alive while
+   * any adopting window is still attached.
    *
    * @param {string} host - DSH endpoint host.
    * @param {number} port - DSH endpoint port.
+   * @param {object} [options]
+   * @param {string|null} [options.registryFile] - Instance registry path for
+   *   adopter bookkeeping; null (default) keeps the legacy no-bookkeeping behavior.
    * @returns {Promise<object|null>} RunningServer handle, or null.
    */
-  async adoptRunningDsh(host, port) {
+  async adoptRunningDsh(host, port, { registryFile = null } = {}) {
     try {
       this._emit('probing', 'Probing DSH service: http://{host}:{port}…', { host, port });
       const result = await this.probeWithRetry(host, port);
       if (result && result.reachable && result.isDsh) {
         this._emit('reusing', 'Found a running DSH instance at http://{host}:{port}, reusing', { host, port });
         this._startHealthWatch(host, port);
-        return this._reuseHandle(host, port);
+        const handle = this._reuseHandle(host, port);
+        if (!handle.owned) {
+          ServerManager._registerAdopter(registryFile, {
+            port,
+            vscodePid: this.ownerVscodePid,
+            windowId: this.ownerWindowId,
+          });
+        }
+        return handle;
       }
     } catch {
       // The caller keeps its original error and decides whether to surface it.
@@ -670,12 +699,21 @@ class ServerManager {
 
   /**
    * Ensure a DSH web service is available for this VS Code window.
-   *  - autoStart === true (default) is window-owned mode: reuse only this
-   *    manager's own healthy child. Any service already occupying the
-   *    configured port belongs to somebody else, so scan forward and spawn a
-   *    dedicated child. This gives each VS Code extension host one process.
-   *  - autoStart === false is user-managed mode: reuse a DSH already running
-   *    on the configured port and never stop it.
+   *  - shareMode 'window' (default, legacy): autoStart === true is
+   *    window-owned mode — reuse only this manager's own healthy child; any
+   *    service already occupying the configured port belongs to somebody
+   *    else, so scan forward and spawn a dedicated child. This gives each
+   *    VS Code extension host one process. autoStart === false is
+   *    user-managed mode: reuse a DSH already running on the configured port
+   *    and never stop it.
+   *  - shareMode 'environment' (shared-instance mode): every window of one
+   *    OS environment (Windows vs WSL) converges on ONE instance. A DSH
+   *    answer on the configured port is adopted (never spawned past), then
+   *    this environment's own `dsh web` processes are discovered and probed
+   *    (see _ensureSharedEnvironmentServer). Spawning happens only when
+   *    nothing answers, followed by one adoption retry that settles a
+   *    simultaneous-start race between sibling windows. autoStart === false
+   *    keeps the strict user-managed semantics in this mode as well.
    *  - A non-DSH occupant scans from port + 1; an unreachable port scans from
    *    the configured port itself.
    *  - autoStart === false when reuse is impossible (non-DSH occupant or
@@ -686,9 +724,20 @@ class ServerManager {
    *    undefined / empty string = not specified — the child inherits the
    *    parent process's cwd (no fallback to the user home directory).
    *  - registryFile: path of the instance registry (JSON array of entries).
+   *  - discoverDshWebPorts: optional async ({platform}) => number[] scanning
+   *    this environment's own processes for running `dsh web` ports; only
+   *    used by the environment-shared path (shared mode adoption).
    *  - Returns a RunningServer: { url, host, port, pid, owned }.
    */
-  async ensureServer({ host = DEFAULT_HOST, port = DEFAULT_PORT, autoStart = true, cwd, registryFile } = {}) {
+  async ensureServer({
+    host = DEFAULT_HOST,
+    port = DEFAULT_PORT,
+    autoStart = true,
+    cwd,
+    registryFile,
+    shareMode = SHARE_MODES.WINDOW,
+    discoverDshWebPorts = null,
+  } = {}) {
     const generation = this._cancelGeneration;
     if (host !== DEFAULT_HOST) {
       throw new ServerError(STARTUP_ERRORS.CONFIG_HOST_UNSUPPORTED.template, {
@@ -719,6 +768,20 @@ class ServerManager {
     const r = await this.probeWithRetry(host, port);
     this._throwIfCancelled(generation);
 
+    // Shared-instance mode: converge on the one DSH of this OS environment.
+    if (shareMode === SHARE_MODES.ENVIRONMENT) {
+      return this._ensureSharedEnvironmentServer({
+        host,
+        port,
+        autoStart,
+        cwd,
+        registryFile,
+        generation,
+        probeResult: r,
+        discoverDshWebPorts,
+      });
+    }
+
     // Step 3: reuse is an explicit user-managed mode only. Default autoStart
     // never adopts another window's child or a manually started service.
     if (!autoStart) {
@@ -730,13 +793,106 @@ class ServerManager {
     }
 
     // Step 4: any occupied port belongs to another owner and must not be
-    // reused; a dead port can host this window's new child. A probe that
-    // timed out means a listener exists but did not answer — also occupied, so
-    // only an explicit connection refusal counts as free. Within one
-    // ServerManager instance, never reuse the last port this instance
-    // spawned (fresh origin) so DSH does not cache the previous workspace
-    // under the same origin.
-    const occupied = r.reachable || r.reason !== 'refused';
+    // reused; a dead port can host this window's new child.
+    return this._spawnOnFreePort({ host, port, cwd, registryFile, generation, probeResult: r });
+  }
+
+  /**
+   * Shared-instance ensure (shareMode 'environment'): converge every window
+   * of one OS environment (Windows vs WSL) onto ONE DSH instance.
+   *
+   *  - Step A: whatever already answers as DSH on the configured port IS the
+   *    shared instance — adopt it (non-owned handle), whatever window or
+   *    terminal started it.
+   *  - Step B (autoStart only): the configured port is silent, so scan this
+   *    environment's own processes (`ps` under WSL/Linux, PowerShell on
+   *    Windows — each OS only sees its own processes, which is what keeps
+   *    the Windows and WSL namespaces apart) for `dsh web` listeners on
+   *    other ports and adopt the first one that answers as DSH.
+   *  - Step C: nobody home → spawn the environment's shared instance on the
+   *    configured port when free (so later windows find it exactly there),
+   *    scanning forward only past a non-DSH occupant. A simultaneous-start
+   *    race — a sibling window binds the port between our probe and our
+   *    spawn, our child dies of EADDRINUSE — is settled by one more adoption
+   *    round before the spawn error stands.
+   *
+   * The spawning window owns the child (registry entry with its vscodePid);
+   * adopters register themselves as attachers so the owner's exit path can
+   * leave the instance running for them (see _registerAdopter and
+   * ownedChildHasLiveAdopters).
+   */
+  async _ensureSharedEnvironmentServer({
+    host,
+    port,
+    autoStart,
+    cwd,
+    registryFile,
+    generation,
+    probeResult,
+    discoverDshWebPorts,
+  }) {
+    this._throwIfCancelled(generation);
+
+    // Step A: adopt the DSH answering on the configured port.
+    if (probeResult.reachable && probeResult.isDsh) {
+      const adopted = await this.adoptRunningDsh(host, port, { registryFile });
+      if (adopted) return adopted;
+    }
+
+    // Step B: discover this environment's own `dsh web` listeners elsewhere.
+    if (autoStart && typeof discoverDshWebPorts === 'function') {
+      for (const candidate of await this._discoverEnvironmentDshPorts(discoverDshWebPorts)) {
+        if (candidate === port) continue;
+        this._throwIfCancelled(generation);
+        const adopted = await this.adoptRunningDsh(host, candidate, { registryFile });
+        if (adopted) return adopted;
+      }
+    }
+
+    if (!autoStart) {
+      throw new ServerError(STARTUP_ERRORS.AUTOSTART_DISABLED.template, {}, 'AUTOSTART_DISABLED');
+    }
+
+    // Step C: spawn, then settle a start race with one adoption retry.
+    try {
+      return await this._spawnOnFreePort({ host, port, cwd, registryFile, generation, probeResult });
+    } catch (spawnError) {
+      this._throwIfCancelled(generation);
+      const raced = await this.adoptRunningDsh(host, port, { registryFile });
+      if (raced) return raced;
+      if (typeof discoverDshWebPorts === 'function') {
+        for (const candidate of await this._discoverEnvironmentDshPorts(discoverDshWebPorts)) {
+          if (candidate === port) continue;
+          const adopted = await this.adoptRunningDsh(host, candidate, { registryFile });
+          if (adopted) return adopted;
+        }
+      }
+      throw spawnError;
+    }
+  }
+
+  /** Best-effort discovery of this environment's running `dsh web` ports. */
+  async _discoverEnvironmentDshPorts(discoverDshWebPorts) {
+    try {
+      const ports = await discoverDshWebPorts({ platform: process.platform });
+      if (!Array.isArray(ports)) return [];
+      return ports.filter((candidate) => Number.isInteger(candidate) && candidate > 0 && candidate < 65536);
+    } catch {
+      return []; // discovery is best-effort: fall through to spawn
+    }
+  }
+
+  /**
+   * Window-owned spawn path (also the shared-mode Step C): only a port that
+   * explicitly refuses connections counts as free. A probe that timed out
+   * means a listener exists but did not answer — also occupied, so it is
+   * skipped conservatively instead of risking an EADDRINUSE spawn and a
+   * misleading "process exited early" error. Within one ServerManager
+   * instance, never reuse the last port this instance spawned (fresh origin)
+   * so DSH does not cache the previous workspace under the same origin.
+   */
+  async _spawnOnFreePort({ host, port, cwd, registryFile, generation, probeResult }) {
+    const occupied = probeResult.reachable || probeResult.reason !== 'refused';
     let scanStart = occupied ? port + 1 : port;
     if (this._lastSpawnPort !== null && scanStart <= this._lastSpawnPort) {
       scanStart = this._lastSpawnPort + 1;
@@ -907,6 +1063,102 @@ class ServerManager {
       (e) => !(e && e.pid === pid)
     );
     ServerManager._writeRegistry(registryFile, entries);
+  }
+
+  /**
+   * Normalize one attacher identity. Both fields may be null; an identity
+   * with neither a positive vscodePid nor a non-empty windowId is unusable.
+   */
+  static _normalizeAdopter({ vscodePid = null, windowId = null } = {}) {
+    return {
+      vscodePid: Number.isInteger(vscodePid) && vscodePid > 0 ? vscodePid : null,
+      windowId: typeof windowId === 'string' && windowId.length > 0 ? windowId : null,
+    };
+  }
+
+  /**
+   * Record this window as an adopter of the instance registry entry matching
+   * `port` (shared-mode bookkeeping). Best-effort: a missing/corrupt registry
+   * or a dead entry is silently ignored, and adopters already present (by
+   * vscodePid) are never duplicated.
+   */
+  static _registerAdopter(registryFile, { port, vscodePid, windowId }) {
+    if (!registryFile || !Number.isInteger(port)) return;
+    const adopter = ServerManager._normalizeAdopter({ vscodePid, windowId });
+    if (adopter.vscodePid === null && adopter.windowId === null) return;
+    const entries = ServerManager._readRegistryRaw(registryFile);
+    let changed = false;
+    for (const entry of entries) {
+      if (!entry || entry.port !== port || !ServerManager._isProcessAlive(entry.pid)) continue;
+      const attachers = Array.isArray(entry.attachers) ? [...entry.attachers] : [];
+      const duplicate = attachers.some((a) => a && (
+        adopter.vscodePid !== null ? a.vscodePid === adopter.vscodePid : a.windowId === adopter.windowId
+      ));
+      if (duplicate) continue;
+      attachers.push(adopter);
+      entry.attachers = attachers;
+      changed = true;
+    }
+    if (changed) ServerManager._writeRegistry(registryFile, entries);
+  }
+
+  /**
+   * Remove this window's attacher record from every registry entry (called
+   * on deactivation). Matching is by vscodePid OR windowId so a window whose
+   * extension-host pid changed between adopt cycles is still cleaned up.
+   */
+  static removeAdopterFromRegistry(registryFile, { vscodePid = null, windowId = null } = {}) {
+    if (!registryFile) return;
+    const target = ServerManager._normalizeAdopter({ vscodePid, windowId });
+    if (target.vscodePid === null && target.windowId === null) return;
+    const entries = ServerManager._readRegistryRaw(registryFile);
+    let changed = false;
+    for (const entry of entries) {
+      if (!entry || !Array.isArray(entry.attachers) || entry.attachers.length === 0) continue;
+      const filtered = entry.attachers.filter((a) => {
+        if (!a || typeof a !== 'object') return true;
+        const pidMatch = target.vscodePid !== null && a.vscodePid === target.vscodePid;
+        const winMatch = target.windowId !== null && a.windowId === target.windowId;
+        return !(pidMatch || winMatch);
+      });
+      if (filtered.length !== entry.attachers.length) {
+        entry.attachers = filtered;
+        changed = true;
+      }
+    }
+    if (changed) ServerManager._writeRegistry(registryFile, entries);
+  }
+
+  /**
+   * True when the entry carries at least one attacher whose extension-host
+   * pid is still alive (optionally excluding one pid, e.g. our own).
+   */
+  static entryHasLiveAdopters(entry, { excludeVscodePid = null, isProcessAlive = null } = {}) {
+    const alive = typeof isProcessAlive === 'function' ? isProcessAlive : (pid) => ServerManager._isProcessAlive(pid);
+    const attachers = entry && Array.isArray(entry.attachers) ? entry.attachers : [];
+    return attachers.some((a) => a
+      && Number.isInteger(a.vscodePid)
+      && a.vscodePid > 0
+      && a.vscodePid !== excludeVscodePid
+      && alive(a.vscodePid));
+  }
+
+  /**
+   * True when the instance this manager spawned is currently adopted by at
+   * least one other live window (shared-instance mode): the owner's exit
+   * path then leaves the child running for those windows instead of killing
+   * it, and the activation sweep reclaims it once every attacher is gone.
+   *
+   * @param {string|null} registryFile - Instance registry path.
+   * @returns {Promise<boolean>}
+   */
+  async ownedChildHasLiveAdopters(registryFile) {
+    if (!this._child || !registryFile) return false;
+    const pid = this._child.pid;
+    if (!Number.isInteger(pid)) return false;
+    const entry = ServerManager._readRegistryRaw(registryFile).find((e) => e && e.pid === pid);
+    if (!entry) return false;
+    return ServerManager.entryHasLiveAdopters(entry, { excludeVscodePid: this.ownerVscodePid });
   }
 
   /** Pure launch-spec assembly for the configured managed runtime and optional embed overlay. */
@@ -1426,7 +1678,11 @@ class ServerManager {
    *  - legacy entries WITHOUT a numeric vscodePid are left alone — they may
    *    belong to a still-running pre-C1 window, and dead-child pruning of such
    *    entries stays the job of cleanupStaleRegistry();
-   *  - entries owned by `currentVscodePid` (this window) are never swept.
+   *  - entries owned by `currentVscodePid` (this window) are never swept;
+   *  - shared-mode entries with attachers (windows that adopted a dead
+   *    owner's instance) stay alive while any attacher extension-host is
+   *    still running — dead attacher pids are pruned on the way; the entry
+   *    is swept only once the owner AND every attacher are gone.
    *
    * Reuses the exact tree-kill implementation that backs the orphan-cleanup
    * command (`killProcessTree`); nothing here re-implements process killing.
@@ -1443,6 +1699,7 @@ class ServerManager {
     const alive = typeof isProcessAlive === 'function' ? isProcessAlive : (pid) => ServerManager._isProcessAlive(pid);
     const keep = [];
     const swept = [];
+    let attachersPruned = false;
     for (const entry of ServerManager._readRegistryRaw(registryFile)) {
       if (!entry || !Number.isInteger(entry.pid)) {
         keep.push(entry);
@@ -1463,6 +1720,20 @@ class ServerManager {
         keep.push(entry);
         continue;
       }
+      // Owner is dead: shared-mode adopters keep the instance alive until
+      // the last of them exits; only then is the orphan reclaimed.
+      if (Array.isArray(entry.attachers) && entry.attachers.length > 0) {
+        const live = entry.attachers.filter((a) => a
+          && Number.isInteger(a.vscodePid)
+          && a.vscodePid > 0
+          && alive(a.vscodePid));
+        if (live.length > 0) {
+          entry.attachers = live;
+          attachersPruned = true;
+          keep.push(entry);
+          continue;
+        }
+      }
       try {
         await kill(entry.pid);
       } catch {
@@ -1470,7 +1741,7 @@ class ServerManager {
       }
       swept.push({ pid: entry.pid, port: entry.port, vscodePid: owner });
     }
-    if (swept.length > 0) {
+    if (swept.length > 0 || attachersPruned) {
       ServerManager._writeRegistry(registryFile, keep);
     }
     return swept;

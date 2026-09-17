@@ -3,30 +3,32 @@
 /**
  * Session navigation for the DSH sidebar.
  *
- * Thin client over the DSH Web API's session.list / session.create methods
+ * Thin client over the DSH Web API's session/list / session/create methods
  * plus pure mapping helpers for the QuickPick UI. The extension host does not
  * keep a second session tree: the DSH server stays the single source of truth
  * and the sidebar only remembers the one session id that should be passed to
  * the iframe as the `dsh_session` query parameter.
  *
- * Wire compatibility (verified 2026-09-02 against upstream master 49a606bc5b
- * / 0.1.2-alpha.5): session.list / create / rename keep their envelopes,
- * payloads, and row keys across runtimes 0.1.0-rc.7 .. 0.1.2-alpha.x. The
- * upstream source anchors below cite `dsh-host-apiproxy` (runtimes <=
- * 0.1.1-rc.2); 0.1.2-alpha moved them to `@deepseek-ai/dsh-api-session-
- * controller` with the same shapes. The projections column stays optional on
- * every version - rows without it fall back to bare session ids.
+ * Wire compatibility (verified 2026-09-17 against the installed dsh 0.1.5-rc.1
+ * typert gateway): the session methods moved from the dotted `dsh-host-
+ * apiproxy` paths (`/api/session.list`) to slashed typert endpoints
+ * (`/api/session/list`) with the payload wrapped in `{ args: { ... } }`, where
+ * the parameter is named `_request` for session/list and `request` everywhere
+ * else. The upstream source anchors cite `@deepseek-ai/dsh-api-session-
+ * controller`. The server response envelope and the session row shapes are
+ * unchanged. The projections column stays optional - rows without it fall back
+ * to bare session ids.
  */
 
 const path = require("node:path");
 const crypto = require("node:crypto");
 
 /** API path for the JSON-RPC session methods. @type {string} */
-const SESSION_LIST_PATH = "/api/session.list";
+const SESSION_LIST_PATH = "/api/session/list";
 /** API path for the JSON-RPC session methods. @type {string} */
-const SESSION_CREATE_PATH = "/api/session.create";
+const SESSION_CREATE_PATH = "/api/session/create";
 /** API path for the session.rename method. @type {string} */
-const SESSION_RENAME_PATH = "/api/session.rename";
+const SESSION_RENAME_PATH = "/api/session/rename";
 
 /** Valid base URL hostnames for the loopback DSH Web API. */
 const ALLOWED_HOSTNAMES = new Set(["127.0.0.1", "localhost"]);
@@ -86,7 +88,7 @@ function assertLoopbackBaseUrl(baseUrl) {
  * API keeps the host/port untouched and replaces any path on the base.
  *
  * @param {URL} baseUrl - Validated base URL.
- * @param {string} apiPath - API path, e.g. "/api/session.list".
+ * @param {string} apiPath - API path, e.g. "/api/session/list".
  * @returns {string} Absolute endpoint URL.
  */
 function endpointUrl(baseUrl, apiPath) {
@@ -123,18 +125,23 @@ function isAbortError(err) {
 }
 
 /**
- * Build the JSON-RPC request envelope shared by all session methods.
+ * Build the typert gateway request envelope shared by all DSH methods.
  *
- * @param {string} method - DSH method name.
- * @param {object} payload - Method payload.
- * @returns {object} JSON-RPC client request envelope.
+ * The typert protocol wraps every argument map in `payload.args`, where each
+ * endpoint names its parameters (see the comment at the top of this file for
+ * the `_request` vs `request` split).
+ *
+ * @param {string} method - DSH typert method name (`session/list`, ...).
+ * @param {object} args - Endpoint argument map (`{ _request: {} }` for
+ *   session/list, `{ request: { ... } }` for every other method).
+ * @returns {object} Typert client request envelope.
  */
-function clientRequest(method, payload) {
+function clientRequest(method, args) {
   return {
     type: "client-request",
     rpcId: crypto.randomUUID(),
     method,
-    payload,
+    payload: { args },
   };
 }
 
@@ -254,7 +261,7 @@ async function postJson(baseUrl, apiPath, envelope, fetchImpl, signal) {
 }
 
 /**
- * List DSH sessions through `POST <baseUrl>/api/session.list`.
+ * List DSH sessions through `POST <baseUrl>/api/session/list`.
  *
  * @param {string} baseUrl - Loopback base URL (`http://127.0.0.1:<port>` or
  *   `http://localhost:<port>`).
@@ -272,7 +279,7 @@ async function listSessions(baseUrl, options = {}) {
   const response = await postJson(
     parsed,
     SESSION_LIST_PATH,
-    clientRequest("session.list", {}),
+    clientRequest("session/list", { _request: {} }),
     fetchImpl,
     options.signal
   );
@@ -302,7 +309,7 @@ async function listSessions(baseUrl, options = {}) {
 }
 
 /**
- * Create a DSH session through `POST <baseUrl>/api/session.create`.
+ * Create a DSH session through `POST <baseUrl>/api/session/create`.
  *
  * @param {string} baseUrl - Loopback base URL (`http://127.0.0.1:<port>` or
  *   `http://localhost:<port>`).
@@ -330,7 +337,7 @@ async function createSession(baseUrl, options = {}) {
   const response = await postJson(
     parsed,
     SESSION_CREATE_PATH,
-    clientRequest("session.create", payload),
+    clientRequest("session/create", { request: payload }),
     fetchImpl,
     options.signal
   );
@@ -353,15 +360,15 @@ async function createSession(baseUrl, options = {}) {
 }
 
 /**
- * Rename a DSH session through POST <baseUrl>/api/session.rename (B2:
+ * Rename a DSH session through POST <baseUrl>/api/session/rename (B2:
  * sessions created through the API otherwise keep bare-UUID titles).
  *
  * Wire schema pinned from real source:
- *   dsh-host-apiproxy/lib/types/api/sessions.schema.js L79-88 -
- *   sessionRenameRequestSchema { sessionId, title } (raw title) and
- *   sessionRenameValueSchema { title, seq }. The host normalizes the raw
- *   title (control characters stripped, whitespace collapsed, UTF-8 byte
- *   budget enforced); a title that normalizes to empty rejects with the
+ *   @deepseek-ai/dsh-api-session-controller (typert) -
+ *   SessionRenameRequest { sessionId, title } (raw title) and the
+ *   SessionRenameValue { title, seq }. The host normalizes the raw title
+ *   (control characters stripped, whitespace collapsed, UTF-8 byte budget
+ *   enforced); a title that normalizes to empty rejects with the
  *   "title-invalid" business error.
  *
  * @param {string} baseUrl - Loopback base URL (http://127.0.0.1:<port> or
@@ -389,7 +396,7 @@ async function renameSession(baseUrl, options = {}) {
   const response = await postJson(
     parsed,
     SESSION_RENAME_PATH,
-    clientRequest("session.rename", { sessionId: options.sessionId, title: options.title }),
+    clientRequest("session/rename", { request: { sessionId: options.sessionId, title: options.title } }),
     fetchImpl,
     options.signal
   );
@@ -439,7 +446,7 @@ async function ensureWorkspaceSession(baseUrl, cwd, options = {}) {
 }
 
 /**
- * Read a human-readable title from a session.list row's projection column.
+ * Read a human-readable title from a session/list row's projection column.
  *
  * Two wire shapes exist across DSH runtime versions: the current rc emits
  * the plain string `projections.values.title`, while older builds wrapped
@@ -450,7 +457,7 @@ async function ensureWorkspaceSession(baseUrl, cwd, options = {}) {
  * the bare session id. B2 follow-up: reading only the legacy shape made
  * EVERY runtime-titled session render as a bare UUID.
  *
- * @param {object} item - Raw `session.list` item.
+ * @param {object} item - Raw `session/list` item.
  * @returns {string} Title, or "" when not derivable.
  */
 function readableSessionTitle(item) {
@@ -471,7 +478,7 @@ function readableSessionTitle(item) {
  *
  * Only `sessionId` is required; every other field is passed through loosely.
  *
- * @param {Array<object>} items - Raw `session.list` items.
+ * @param {Array<object>} items - Raw `session/list` items.
  * @returns {Array<object>} Rows shaped as
  *   `{ sessionId, title, cwd, updatedAt, running, blank }`.
  */
@@ -515,7 +522,7 @@ function sameCwd(a, b) {
 /**
  * Find a blank root session for the given cwd and return its session id.
  *
- * @param {Array<object>} items - Raw `session.list` items.
+ * @param {Array<object>} items - Raw `session/list` items.
  * @param {string} cwd - Workspace root to match.
  * @returns {string|null} session id, or null when cwd is empty or no blank
  *   session matches the resolved cwd.

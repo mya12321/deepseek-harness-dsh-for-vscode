@@ -656,3 +656,374 @@ test('ready entries without an owner identity stay legacy-compatible (null keys)
   assert.strictEqual(entry.vscodePid, null);
   assert.strictEqual(entry.windowId, null);
 });
+
+// ---------------------------------------------------------------------------
+// Shared-instance mode (dsh.share.mode = "environment")
+// ---------------------------------------------------------------------------
+
+function createDshHttpServer() {
+  return http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<!doctype html><script>window.__DSH_BOOT__={config:{}}</script>');
+  });
+}
+
+class NoSpawnManager extends ServerManager {
+  constructor() {
+    super();
+    this.spawnBranch = false;
+  }
+
+  async _spawnAndWait() {
+    this.spawnBranch = true;
+    throw new Error('spawn-branch-reached');
+  }
+}
+
+test('shared environment mode adopts the DSH instance answering on the configured port', async (t) => {
+  const dshServer = createDshHttpServer();
+  await listen(dshServer);
+  const port = dshServer.address().port;
+  t.after(() => close(dshServer));
+
+  const registryFile = path.join(os.tmpdir(), `dsh-shared-adopt-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(registryFile, '[]');
+  t.after(() => fs.rmSync(registryFile, { force: true }));
+
+  const manager = new NoSpawnManager();
+  t.after(() => manager.stop());
+  const handle = await manager.ensureServer({
+    host: '127.0.0.1', port, autoStart: true, cwd: null, registryFile, shareMode: 'environment',
+  });
+
+  // A DSH answer on the configured port IS the shared instance — adopted,
+  // never spawned past, regardless of which window started it.
+  assert.deepStrictEqual(handle, {
+    url: `http://127.0.0.1:${port}`,
+    host: '127.0.0.1',
+    port,
+    pid: null,
+    owned: false,
+  });
+  assert.strictEqual(manager.spawnBranch, false, 'the spawn path must never be reached');
+});
+
+test('shared environment mode discovers and adopts a DSH listener on another local port', async (t) => {
+  const plainServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('hello');
+  });
+  const dshServer = createDshHttpServer();
+  await listen(plainServer);
+  await listen(dshServer);
+  const plainPort = plainServer.address().port;
+  const dshPort = dshServer.address().port;
+  t.after(() => close(plainServer));
+  t.after(() => close(dshServer));
+
+  const registryFile = path.join(os.tmpdir(), `dsh-shared-disc-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(registryFile, '[]');
+  t.after(() => fs.rmSync(registryFile, { force: true }));
+
+  const manager = new NoSpawnManager();
+  t.after(() => manager.stop());
+  let discoveryCalls = 0;
+  const handle = await manager.ensureServer({
+    host: '127.0.0.1', port: plainPort, autoStart: true, cwd: null, registryFile, shareMode: 'environment',
+    discoverDshWebPorts: async () => {
+      discoveryCalls += 1;
+      return [dshPort];
+    },
+  });
+
+  assert.strictEqual(handle.port, dshPort, 'the discovered DSH listener is adopted');
+  assert.strictEqual(handle.owned, false);
+  assert.strictEqual(discoveryCalls, 1);
+  assert.strictEqual(manager.spawnBranch, false);
+});
+
+test('shared environment mode spawns on the configured port when nothing answers', async (t) => {
+  const temporaryServer = http.createServer();
+  await listen(temporaryServer);
+  const freePort = temporaryServer.address().port;
+  await close(temporaryServer);
+
+  const registryFile = path.join(os.tmpdir(), `dsh-shared-spawn-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(registryFile, '[]');
+  t.after(() => fs.rmSync(registryFile, { force: true }));
+
+  const manager = new NoSpawnManager();
+  t.after(() => manager.stop());
+  await assert.rejects(
+    manager.ensureServer({
+      host: '127.0.0.1', port: freePort, autoStart: true, cwd: null, registryFile, shareMode: 'environment',
+      discoverDshWebPorts: async () => [],
+    }),
+    /spawn-branch-reached/
+  );
+  assert.strictEqual(manager.spawnBranch, true);
+});
+
+test('shared environment mode scans forward past a non-DSH occupant', async (t) => {
+  const plainServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('hello');
+  });
+  await listen(plainServer);
+  const plainPort = plainServer.address().port;
+  t.after(() => close(plainServer));
+
+  const registryFile = path.join(os.tmpdir(), `dsh-shared-scan-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(registryFile, '[]');
+  t.after(() => fs.rmSync(registryFile, { force: true }));
+
+  const manager = new NoSpawnManager();
+  t.after(() => manager.stop());
+  await assert.rejects(
+    manager.ensureServer({
+      host: '127.0.0.1', port: plainPort, autoStart: true, cwd: null, registryFile, shareMode: 'environment',
+      discoverDshWebPorts: async () => [],
+    }),
+    /spawn-branch-reached/
+  );
+  assert.strictEqual(manager.spawnBranch, true, 'a non-DSH occupant is scanned past, not adopted');
+});
+
+test('shared environment mode keeps strict user-managed semantics for autoStart false', async (t) => {
+  const temporaryServer = http.createServer();
+  await listen(temporaryServer);
+  const freePort = temporaryServer.address().port;
+  await close(temporaryServer);
+
+  const manager = new NoSpawnManager();
+  t.after(() => manager.stop());
+  await assert.rejects(
+    manager.ensureServer({
+      host: '127.0.0.1', port: freePort, autoStart: false, cwd: null, registryFile: null, shareMode: 'environment',
+      discoverDshWebPorts: async () => [41999],
+    }),
+    (error) => error.code === 'AUTOSTART_DISABLED'
+  );
+  assert.strictEqual(manager.spawnBranch, false);
+});
+
+test('shared environment mode settles a spawn race with one adoption retry', async (t) => {
+  const temporaryServer = http.createServer();
+  await listen(temporaryServer);
+  const configuredPort = temporaryServer.address().port;
+  await close(temporaryServer);
+
+  const registryFile = path.join(os.tmpdir(), `dsh-shared-race-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(registryFile, '[]');
+  t.after(() => fs.rmSync(registryFile, { force: true }));
+
+  class RaceLoserManager extends ServerManager {
+    async _spawnAndWait(host, port) {
+      // A sibling window won the race: its DSH now answers on the configured
+      // port while our own child died of EADDRINUSE (simulated by throwing).
+      this.sibling = createDshHttpServer();
+      await new Promise((resolve) => this.sibling.listen(port, '127.0.0.1', resolve));
+      throw new Error('simulated spawn race lost');
+    }
+  }
+
+  const manager = new RaceLoserManager();
+  t.after(async () => {
+    await manager.stop();
+    await close(manager.sibling);
+  });
+  const handle = await manager.ensureServer({
+    host: '127.0.0.1', port: configuredPort, autoStart: true, cwd: null, registryFile, shareMode: 'environment',
+  });
+
+  assert.deepStrictEqual(handle, {
+    url: `http://127.0.0.1:${configuredPort}`,
+    host: '127.0.0.1',
+    port: configuredPort,
+    pid: null,
+    owned: false,
+  }, 'the race winner is adopted instead of surfacing the spawn error');
+});
+
+test('window-owned mode ignores discovery and never adopts an occupied port', async (t) => {
+  const plainServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('hello');
+  });
+  const dshServer = createDshHttpServer();
+  await listen(plainServer);
+  await listen(dshServer);
+  const plainPort = plainServer.address().port;
+  const dshPort = dshServer.address().port;
+  t.after(() => close(plainServer));
+  t.after(() => close(dshServer));
+
+  const registryFile = path.join(os.tmpdir(), `dsh-window-disc-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(registryFile, '[]');
+  t.after(() => fs.rmSync(registryFile, { force: true }));
+
+  // Default shareMode (window) and the explicit value must behave the same:
+  // an occupied port belongs to somebody else — scan forward and spawn.
+  for (const shareMode of [undefined, 'window']) {
+    const manager = new NoSpawnManager();
+    t.after(() => manager.stop());
+    await assert.rejects(
+      manager.ensureServer({
+        host: '127.0.0.1', port: plainPort, autoStart: true, cwd: null, registryFile, shareMode,
+        discoverDshWebPorts: async () => [dshPort],
+      }),
+      /spawn-branch-reached/
+    );
+    assert.strictEqual(manager.spawnBranch, true, `shareMode ${shareMode ?? '(default)'} must never adopt`);
+  }
+});
+
+test('shared-mode adopter bookkeeping records, dedupes and removes attachers', (t) => {
+  const file = path.join(os.tmpdir(), `dsh-adopters-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: process.pid, port: 32150, host: '127.0.0.1', cwd: null, vscodePid: 555000, at: 1 },
+    { pid: 99999999, port: 32151, host: '127.0.0.1', cwd: null, vscodePid: 555001, at: 2 },
+  ], null, 2));
+
+  ServerManager._registerAdopter(file, { port: 32150, vscodePid: 777001, windowId: 'w-a' });
+  ServerManager._registerAdopter(file, { port: 32150, vscodePid: 777001, windowId: 'w-a' }); // dedupe
+  ServerManager._registerAdopter(file, { port: 32150, vscodePid: 777003, windowId: null });
+  ServerManager._registerAdopter(file, { port: 32151, vscodePid: 777002, windowId: 'w-b' }); // dead child entry
+  ServerManager._registerAdopter(file, { port: 32150, vscodePid: null, windowId: null }); // unusable identity
+
+  let entries = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepStrictEqual(entries[0].attachers, [
+    { vscodePid: 777001, windowId: 'w-a' },
+    { vscodePid: 777003, windowId: null },
+  ], 'live entries gain the adopter exactly once');
+  assert.strictEqual(entries[1].attachers, undefined, 'dead entries are never annotated');
+
+  assert.strictEqual(
+    ServerManager.entryHasLiveAdopters(entries[0], { isProcessAlive: (pid) => pid === 777001 }),
+    true
+  );
+  assert.strictEqual(
+    ServerManager.entryHasLiveAdopters(entries[0], { isProcessAlive: () => false }),
+    false
+  );
+  // Self-exclusion: when the only attacher is the consulting window itself,
+  // there is no OTHER live adopter left to protect the instance for.
+  const selfOnly = { attachers: [{ vscodePid: 777001, windowId: 'w-a' }] };
+  assert.strictEqual(
+    ServerManager.entryHasLiveAdopters(selfOnly, { excludeVscodePid: 777001, isProcessAlive: () => true }),
+    false
+  );
+  assert.strictEqual(
+    ServerManager.entryHasLiveAdopters(selfOnly, { excludeVscodePid: 999999, isProcessAlive: () => true }),
+    true
+  );
+
+  ServerManager.removeAdopterFromRegistry(file, { vscodePid: 777001 });
+  entries = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepStrictEqual(entries[0].attachers, [{ vscodePid: 777003, windowId: null }]);
+
+  ServerManager.removeAdopterFromRegistry(file, { vscodePid: 777003 });
+  entries = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepStrictEqual(entries[0].attachers, [], 'the last attacher removal leaves an empty list');
+});
+
+test('ownedChildHasLiveAdopters reflects the registry for this manager child', async (t) => {
+  const file = path.join(os.tmpdir(), `dsh-owned-adopt-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    {
+      pid: process.pid, port: 32160, host: '127.0.0.1', cwd: null,
+      vscodePid: 555010, windowId: 'w-owner', at: 1,
+      // process.pid is really alive, so the default liveness check passes.
+      attachers: [{ vscodePid: process.pid, windowId: 'w-live' }],
+    },
+  ], null, 2));
+
+  const manager = new ServerManager();
+  manager.setOwnerIdentity({ vscodePid: 555010, windowId: 'w-owner' });
+  manager._child = { pid: process.pid };
+  assert.strictEqual(
+    await manager.ownedChildHasLiveAdopters(file),
+    true,
+    'a live attacher keeps the shared instance protected'
+  );
+
+  fs.writeFileSync(file, JSON.stringify([
+    {
+      pid: process.pid, port: 32160, host: '127.0.0.1', cwd: null,
+      vscodePid: 555010, windowId: 'w-owner', at: 1,
+      attachers: [{ vscodePid: 777102, windowId: 'w-dead' }],
+    },
+  ], null, 2));
+  assert.strictEqual(
+    await manager.ownedChildHasLiveAdopters(file),
+    false,
+    'a dead attacher no longer protects the instance'
+  );
+
+  manager._child = null;
+  assert.strictEqual(await manager.ownedChildHasLiveAdopters(file), false, 'no owned child → no protection');
+});
+
+test('sweepDeadOwnerEntries keeps a dead-owner instance alive while attachers live', async (t) => {
+  const file = path.join(os.tmpdir(), `dsh-sweep-adopt-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    {
+      pid: 7001, port: 4030, host: '127.0.0.1', cwd: null, vscodePid: 8001, windowId: 'w-owner', at: 1,
+      attachers: [
+        { vscodePid: 8002, windowId: 'w-live' },
+        { vscodePid: 8003, windowId: 'w-dead' },
+      ],
+    },
+  ], null, 2));
+  const terminated = [];
+
+  // Owner 8001 is dead; attacher 8002 is alive, attacher 8003 is gone.
+  const swept = await ServerManager.sweepDeadOwnerEntries(file, {
+    terminate: async (pid) => { terminated.push(pid); },
+    isProcessAlive: (pid) => pid === 8002,
+    currentVscodePid: null,
+  });
+
+  assert.deepStrictEqual(swept, [], 'a live attacher protects the dead-owner instance');
+  assert.deepStrictEqual(terminated, []);
+  const kept = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(kept.length, 1);
+  assert.deepStrictEqual(kept[0].attachers, [{ vscodePid: 8002, windowId: 'w-live' }],
+    'dead attacher pids are pruned in the same pass');
+
+  // Once the last attacher is gone too, the orphan is reclaimed.
+  const sweptLater = await ServerManager.sweepDeadOwnerEntries(file, {
+    terminate: async (pid) => { terminated.push(pid); },
+    isProcessAlive: () => false,
+    currentVscodePid: null,
+  });
+  assert.deepStrictEqual(sweptLater.map((entry) => entry.pid), [7001]);
+  assert.deepStrictEqual(terminated, [7001]);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')), []);
+});
+
+test('adoptRunningDsh records the adopting window in the instance registry', async (t) => {
+  const dshServer = createDshHttpServer();
+  await listen(dshServer);
+  const port = dshServer.address().port;
+  t.after(() => close(dshServer));
+
+  const file = path.join(os.tmpdir(), `dsh-adopt-reg-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: process.pid, port, host: '127.0.0.1', cwd: null, vscodePid: 424242, windowId: 'w-origin', at: Date.now() },
+  ], null, 2));
+
+  const manager = new ServerManager();
+  manager.setOwnerIdentity({ vscodePid: process.pid, windowId: 'w-adopter' });
+  t.after(() => manager.stop());
+  const handle = await manager.adoptRunningDsh('127.0.0.1', port, { registryFile: file });
+
+  assert.strictEqual(handle.owned, false);
+  const entry = JSON.parse(fs.readFileSync(file, 'utf8'))[0];
+  assert.deepStrictEqual(entry.attachers, [{ vscodePid: process.pid, windowId: 'w-adopter' }],
+    'the adoption must be visible to the spawning window exit path and the sweep');
+});

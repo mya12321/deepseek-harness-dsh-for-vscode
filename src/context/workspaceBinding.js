@@ -10,13 +10,22 @@ const path = require("node:path");
  * WorkspaceView and a blank root session, reusing the registry and session
  * APIs instead of killing/restarting the DSH child when the active workspace
  * changes.
+ *
+ * 0.1.5 dropped `workspace.list`, so registration is create-or-adopt:
+ * `workspace.create` returns `{ workspace, created }`. On an owned server a
+ * miss simply registers; on a non-owned (user-managed) server a `created:
+ * true` answer means the extension JUST registered a workspace the user did
+ * not see coming, so the consent gate fires and a decline ROLLS THE CREATION
+ * BACK with `workspace.delete` (safe: the root session is created only after
+ * binding, so the fresh workspace holds no sessions yet). A pre-existing
+ * workspace (`created: false`) proceeds silently - no prompt regression on
+ * every reload.
  */
 
 const { listSessions, createSession } = require("../sessionNavigation");
 const {
-  listWorkspaces,
   createWorkspace,
-  findWorkspaceByPath,
+  deleteWorkspace,
 } = require("../ch2/workspaceClient");
 
 /** @type {Readonly<Record<string,string>>} */
@@ -58,7 +67,8 @@ function initialBinding() {
  * @param {() => string|null|undefined} [options.baseUrlProvider] - Returns the
  *   current DSH loopback base URL; falls back to the server passed to resolve.
  * @param {(cwd: string) => Promise<boolean>|boolean} [options.requestConsent] -
- *   Called when a non-owned server has no workspace for `cwd`. Defaults to a
+ *   Called when a non-owned server had to register a NEW workspace for `cwd`
+ *   (`created === true`); a decline rolls the registration back. Defaults to a
  *   modal VS Code warning.
  * @param {number} [options.debounceMs=250] - Debounce window for resolve calls.
  * @param {(binding: object) => void} [options.onChange] - Called after every
@@ -275,59 +285,48 @@ function createWorkspaceBinding({
 
     try {
       setState({
-        state: BINDING_STATES.MATCHING,
+        state: BINDING_STATES.CREATING,
         cwd,
         workspaceId: null,
         sessionId: null,
         owned,
         error: null,
       });
-      const items = await listWorkspaces(baseUrl, { fetchImpl });
-      let workspace = findWorkspaceByPath(items, cwd, process.platform);
+      // 0.1.5 has no workspace.list: create-or-adopt is the only probe.
+      const created = await createWorkspace(baseUrl, cwd, { fetchImpl });
+      const workspace = created.workspace;
 
-      if (!workspace) {
-        if (owned) {
-          setState({
-            state: BINDING_STATES.CREATING,
-            cwd,
-            workspaceId: null,
-            sessionId: null,
-            owned,
-            error: null,
-          });
-          const created = await createWorkspace(baseUrl, cwd, { fetchImpl });
-          workspace = created.workspace;
-        } else {
-          setState({
-            state: BINDING_STATES.CONSENT,
-            cwd,
-            workspaceId: null,
-            sessionId: null,
-            owned,
-            error: null,
-          });
-          const allowed = await requestConsentFor(cwd);
-          if (!allowed) {
-            setState({
-              state: BINDING_STATES.UNBOUND,
-              cwd,
-              workspaceId: null,
-              sessionId: null,
-              owned,
-              error: null,
-            });
-            return null;
+      if (!owned && created.created === true) {
+        // A shared server just got a workspace registered that the user did
+        // not see coming - the consent gate fires now, before any session is
+        // bound to it.
+        setState({
+          state: BINDING_STATES.CONSENT,
+          cwd,
+          workspaceId: workspace.workspaceId,
+          sessionId: null,
+          owned,
+          error: null,
+        });
+        const allowed = await requestConsentFor(cwd);
+        if (!allowed) {
+          // Roll the fresh registration back. Safe: the root session is
+          // created only below, so the workspace holds no sessions to
+          // cascade. A failed rollback still leaves the binding unbound.
+          try {
+            await deleteWorkspace(baseUrl, { workspaceId: workspace.workspaceId }, { fetchImpl });
+          } catch (_) {
+            /* the decline stands either way */
           }
           setState({
-            state: BINDING_STATES.CREATING,
+            state: BINDING_STATES.UNBOUND,
             cwd,
             workspaceId: null,
             sessionId: null,
             owned,
             error: null,
           });
-          const created = await createWorkspace(baseUrl, cwd, { fetchImpl });
-          workspace = created.workspace;
+          return null;
         }
       }
 
@@ -366,7 +365,8 @@ function createWorkspaceBinding({
   return {
     /**
      * Resolve the DSH workspace/session binding for a server and workspace
-     * root. Calls are debounced; rapid changes produce one workspace.list pass.
+     * root. Calls are debounced; rapid changes produce one create-or-adopt
+     * probe (0.1.5 dropped `workspace.list`).
      *
      * @param {object} server - RunningServer handle.
      * @param {string|null|undefined} cwd - Workspace root.
