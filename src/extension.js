@@ -842,7 +842,10 @@ async function bindServer(context, server, cwd) {
     currentSessionId = sessionId ? sessionIdFromValue(sessionId) : null;
     followEditProjection(currentSessionId);
     const bindingState = workspaceBinding.state();
-    if (bindingState.state === BINDING_STATES.ERROR) {
+    // The controller-wide state can be overwritten by a newer pass (latest
+    // workspace wins), so only treat THIS resolve as failed when it returned
+    // no session and the latest state is the ERROR state.
+    if (sessionId === null && bindingState.state === BINDING_STATES.ERROR) {
       render(statusPage({
         title: loc("DSH workspace binding failed"),
         detail: bindingState.error || loc("Unknown workspace binding error"),
@@ -1147,7 +1150,9 @@ async function rebindToWorkspace(context) {
   currentSessionId = sessionId ? sessionIdFromValue(sessionId) : null;
   followEditProjection(currentSessionId);
   const bindingState = workspaceBinding.state();
-  if (bindingState.state === BINDING_STATES.ERROR) {
+  // Only treat THIS resolve as failed (see bindServer): the controller-wide
+  // state may already belong to a newer pass.
+  if (sessionId === null && bindingState.state === BINDING_STATES.ERROR) {
     render(statusPage({
       title: loc("DSH workspace binding failed"),
       detail: bindingState.error || loc("Unknown workspace binding error"),

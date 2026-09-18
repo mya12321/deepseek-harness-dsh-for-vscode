@@ -92,6 +92,18 @@ function createWorkspaceBinding({
   let currentServer = null;
   let currentCwd = null;
   let disposed = false;
+  /** Identity of the server the cache was populated for. @type {string|null} */
+  let cacheServerId = null;
+  // Run serialization: `workspace/create` + `session/list` + `session/create`
+  // are multi-round-trip flows, so a resolve() arriving while one flow is in
+  // flight (view-resolution connect, workspace rebind, @dsh participant …)
+  // used to start a SECOND concurrent flow. Concurrent flows double-created
+  // sessions (both saw "no matching session" before either created one),
+  // double-prompted the consent dialog, and interleaved setState() so the
+  // caller-visible binding state belonged to the other run. All runs now go
+  // through one promise chain: strictly one at a time, latest (server, cwd)
+  // wins, and every waiter is settled by the run that incorporated it.
+  let runChain = Promise.resolve();
 
   /**
    * Replace the binding snapshot and notify listeners.
@@ -125,6 +137,41 @@ function createWorkspaceBinding({
   function cacheKey(cwd) {
     const resolved = path.resolve(cwd);
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+
+  /**
+   * Identity of the server a binding was resolved against (loopback origin +
+   * owned pid). The in-memory cache must never answer for a different server:
+   * after a reconnect the child may come back on another port (port-conflict
+   * fallback), a different DSH home, or as a foreign shared instance, and a
+   * cached sessionId from the previous instance would point at a workspace or
+   * session that no longer exists there — the sidebar then loads a dead
+   * dsh_session and the workspace silently fails to bind.
+   *
+   * @param {object|null} server - Current server handle.
+   * @returns {string|null} Server identity, or null when unknown.
+   */
+  function serverIdentity(server) {
+    const url = server && typeof server.url === "string" ? server.url : null;
+    if (!url) return null;
+    const pid = server.owned === true && Number.isInteger(server.pid)
+      ? `#${server.pid}`
+      : "";
+    return `${url}${pid}`;
+  }
+
+  /**
+   * Drop the cache whenever the server identity changed since the last run.
+   *
+   * @param {object|null} server - Server handle of the upcoming run.
+   */
+  function ensureCacheServer(server) {
+    const identity = serverIdentity(server);
+    if (identity === null) return;
+    if (cacheServerId !== identity) {
+      cache.clear();
+      cacheServerId = identity;
+    }
   }
 
   /**
@@ -256,6 +303,7 @@ function createWorkspaceBinding({
     }
 
     const owned = Boolean(server && server.owned === true);
+    ensureCacheServer(server);
     const key = cacheKey(cwd);
     if (!forceRefresh && cache.has(key)) {
       const cached = cache.get(key);
@@ -362,11 +410,40 @@ function createWorkspaceBinding({
     }
   }
 
+  /**
+   * Queue one binding pass on the run chain. Strictly one pass executes at a
+   * time; each pass reads the LATEST currentServer/currentCwd (latest-wins)
+   * and settles exactly the waiters handed to it, so a resolve() that arrives
+   * while a pass is in flight is served by a fresh later pass instead of
+   * racing it.
+   *
+   * @param {boolean} forceRefresh - True to bypass the in-memory cache.
+   * @param {Array<(sessionId: string|null) => void>} pending - Waiters this
+   *   pass owns.
+   * @returns {Promise<string|null>} The pass's bound session id.
+   */
+  function enqueueRun(forceRefresh, pending) {
+    const promise = runChain.then(() => {
+      const owned = pending.splice(0);
+      return run(currentServer, currentCwd, forceRefresh).then((sessionId) => {
+        for (const settle of owned) settle(sessionId);
+        return sessionId;
+      });
+    });
+    // Keep the chain alive whatever happens; run() never rejects (it maps
+    // failures to the ERROR state), but a waiter-settle throw must not poison
+    // later passes.
+    runChain = promise.then(() => undefined, () => undefined);
+    return promise;
+  }
+
   return {
     /**
      * Resolve the DSH workspace/session binding for a server and workspace
      * root. Calls are debounced; rapid changes produce one create-or-adopt
-     * probe (0.1.5 dropped `workspace.list`).
+     * probe (0.1.5 dropped `workspace.list`). Passes are serialized: a call
+     * arriving while another pass runs is chained behind it (never concurrent
+     * with it), so session creation and consent prompts cannot duplicate.
      *
      * @param {object} server - RunningServer handle.
      * @param {string|null|undefined} cwd - Workspace root.
@@ -402,15 +479,15 @@ function createWorkspaceBinding({
           timer = null;
           const pending = waiters;
           waiters = [];
-          run(currentServer, currentCwd, false).then((sessionId) => {
-            for (const resolve of pending) resolve(sessionId);
-          });
+          enqueueRun(false, pending);
         }, debounceMs);
       });
     },
 
     /**
      * Force a full re-run of the binding flow, bypassing the in-memory cache.
+     * Serialized with any in-flight/debounced pass; drains waiters resolved
+     * so far so they settle with this refresh's outcome.
      *
      * @returns {Promise<string|null>} Bound session id or null.
      */
@@ -422,11 +499,7 @@ function createWorkspaceBinding({
       }
       const pending = waiters;
       waiters = [];
-      const promise = run(currentServer, currentCwd, true);
-      promise.then((sessionId) => {
-        for (const resolve of pending) resolve(sessionId);
-      });
-      return promise;
+      return enqueueRun(true, pending);
     },
 
     /**
@@ -442,6 +515,7 @@ function createWorkspaceBinding({
       if (disposed) return false;
       if (typeof sessionId !== "string" || sessionId.length === 0) return false;
       if (!currentCwd) return false;
+      ensureCacheServer(currentServer);
       const key = cacheKey(currentCwd);
       const previous = cache.get(key);
       cache.set(key, { workspaceId: previous ? previous.workspaceId : null, sessionId });

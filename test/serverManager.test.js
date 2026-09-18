@@ -1027,3 +1027,164 @@ test('adoptRunningDsh records the adopting window in the instance registry', asy
   assert.deepStrictEqual(entry.attachers, [{ vscodePid: process.pid, windowId: 'w-adopter' }],
     'the adoption must be visible to the spawning window exit path and the sweep');
 });
+
+// ---------------------------------------------------------------------------
+// dsh 0.1.2+ auth fence: token-aware probing, reuse and adoption
+//
+// dsh ≥ 0.1.2-rc.1 answers a tokenless GET / with 401 and fences every /api
+// call behind a cookie minted from the launch token. A tokenless probe
+// therefore classifies a HEALTHY fenced instance as not-DSH: ensureServer
+// used to kill + respawn its own healthy child on every repeated ensure, and
+// adopted handles carried no token so workspace binding 401'd.
+// ---------------------------------------------------------------------------
+
+/** Minimal stand-in for the dsh auth fence: 401 without token, 303 with. */
+function createFencedDshServer(token) {
+  return http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://dsh.invalid');
+    if (req.method === 'GET' && url.pathname === '/' && url.searchParams.get('token') === token) {
+      res.writeHead(303, {
+        'cache-control': 'no-store',
+        location: '/',
+        'set-cookie': `dsh-auth-test=signed; Path=/`,
+      });
+      res.end();
+      return;
+    }
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+}
+
+test('probe recognizes a fenced dsh instance only when it carries the launch token', async (t) => {
+  const fenced = createFencedDshServer('SECRET-TOKEN');
+  await listen(fenced);
+  const port = fenced.address().port;
+  t.after(() => close(fenced));
+
+  const manager = new ServerManager();
+  assert.deepStrictEqual(
+    await manager.probe('127.0.0.1', port),
+    { reachable: true, isDsh: false },
+    'the tokenless probe must not mistake the fence for a non-DSH service upgrade'
+  );
+  assert.deepStrictEqual(
+    await manager.probe('127.0.0.1', port, { token: 'SECRET-TOKEN' }),
+    { reachable: true, isDsh: true }
+  );
+  assert.deepStrictEqual(
+    await manager.probe('127.0.0.1', port, { token: 'WRONG' }),
+    { reachable: true, isDsh: false },
+    'a rejected token must not classify as DSH'
+  );
+});
+
+test('a repeated ensure keeps a healthy fenced owned child and returns the tokened handle', async (t) => {
+  const fenced = createFencedDshServer('SECRET-TOKEN');
+  await listen(fenced);
+  const port = fenced.address().port;
+  t.after(() => close(fenced));
+
+  const manager = new ServerManager();
+  let killed = false;
+  manager._killChild = async () => { killed = true; }; // must never fire here
+  manager._child = { pid: 4242 };
+  manager._ownedServer = {
+    url: `http://127.0.0.1:${port}`,
+    host: '127.0.0.1',
+    port,
+    pid: 4242,
+    owned: true,
+    authToken: 'SECRET-TOKEN',
+    authUrl: `http://127.0.0.1:${port}/?token=SECRET-TOKEN`,
+  };
+  t.after(() => manager.stop());
+
+  const handle = await manager.ensureServer({
+    host: '127.0.0.1', port, autoStart: true, cwd: null, shareMode: 'window',
+  });
+
+  assert.strictEqual(killed, false, 'the healthy fenced child must not be killed');
+  assert.strictEqual(handle.owned, true);
+  assert.strictEqual(handle.pid, 4242);
+  assert.strictEqual(handle.authToken, 'SECRET-TOKEN',
+    'the reuse handle must keep the launch token so the API stays authenticated');
+  assert.strictEqual(handle.authUrl, `http://127.0.0.1:${port}/?token=SECRET-TOKEN`);
+});
+
+test('a repeated ensure still replaces a dead owned child', async (t) => {
+  const manager = new ServerManager();
+  let killed = false;
+  manager._killChild = async () => { killed = true; };
+  manager._child = { pid: 4243 };
+  manager._ownedServer = {
+    url: 'http://127.0.0.1:43099', host: '127.0.0.1', port: 43099, pid: 4243, owned: true,
+  };
+  t.after(() => manager.stop());
+
+  // Port 43099 refuses connections: the child is gone → stop + respawn path.
+  await assert.rejects(
+    manager.ensureServer({ host: '127.0.0.1', port: 43099, autoStart: true, cwd: null, shareMode: 'window' }),
+    () => true
+  );
+  assert.strictEqual(killed, true, 'a dead own child must be cleaned up before respawning');
+});
+
+test('adoptRunningDsh recovers the launch token from the registry spawn log', async (t) => {
+  const fenced = createFencedDshServer('SECRET-TOKEN');
+  await listen(fenced);
+  const port = fenced.address().port;
+  t.after(() => close(fenced));
+
+  const logFile = path.join(os.tmpdir(), `dsh-fenced-log-${process.pid}-${Date.now()}.log`);
+  fs.writeFileSync(logFile, [
+    'some earlier output',
+    `dsh web: http://127.0.0.1:${port}/?token=SECRET-TOKEN`,
+    '',
+  ].join('\n'));
+  t.after(() => fs.rmSync(logFile, { force: true }));
+
+  const file = path.join(os.tmpdir(), `dsh-fenced-reg-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: process.pid, port, host: '127.0.0.1', cwd: null, at: Date.now(), log: logFile },
+  ], null, 2));
+  t.after(() => fs.rmSync(file, { force: true }));
+
+  const manager = new ServerManager();
+  t.after(() => manager.stop());
+  const handle = await manager.adoptRunningDsh('127.0.0.1', port, { registryFile: file });
+
+  assert.ok(handle, 'a fenced instance recorded in the registry must be adoptable');
+  assert.strictEqual(handle.owned, false);
+  assert.strictEqual(handle.authToken, 'SECRET-TOKEN',
+    'the adopted handle must carry the recovered token so workspace binding can authenticate');
+  assert.strictEqual(handle.authUrl, `http://127.0.0.1:${port}/?token=SECRET-TOKEN`);
+});
+
+test('adoptRunningDsh still refuses a fenced instance without a recoverable token', async (t) => {
+  const fenced = createFencedDshServer('SECRET-TOKEN');
+  await listen(fenced);
+  const port = fenced.address().port;
+  t.after(() => close(fenced));
+
+  const manager = new ServerManager();
+  t.after(() => manager.stop());
+  assert.strictEqual(
+    await manager.adoptRunningDsh('127.0.0.1', port, { registryFile: null }),
+    null,
+    'no registry entry → no token → the fenced instance stays unadoptable'
+  );
+});
+
+test('launchTokenFromSpawnLog extracts the token and tolerates missing files', (t) => {
+  const logFile = path.join(os.tmpdir(), `dsh-token-log-${process.pid}-${Date.now()}.log`);
+  t.after(() => fs.rmSync(logFile, { force: true }));
+  fs.writeFileSync(logFile, 'noise\ndsh web: http://127.0.0.1:3080/?token=AbC-123\nmore noise\n');
+  assert.strictEqual(ServerManager.launchTokenFromSpawnLog(logFile), 'AbC-123');
+
+  fs.writeFileSync(logFile, 'dsh web: http://127.0.0.1:3080\n'); // legacy: no token
+  assert.strictEqual(ServerManager.launchTokenFromSpawnLog(logFile), null);
+
+  assert.strictEqual(ServerManager.launchTokenFromSpawnLog(logFile + '.missing'), null);
+  assert.strictEqual(ServerManager.launchTokenFromSpawnLog(null), null);
+});

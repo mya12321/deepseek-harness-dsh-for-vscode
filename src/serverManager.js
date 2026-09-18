@@ -496,8 +496,17 @@ class ServerManager {
     }
   }
 
-  /** Build a reuse handle without losing ownership of our own ready child. */
-  _reuseHandle(host, port) {
+  /**
+   * Build a reuse handle without losing ownership of our own ready child.
+   *
+   * dsh 0.1.2+ fences every /api request behind a browser cookie minted from
+   * the launch token, so a handle without the token can serve an iframe but
+   * CANNOT bind workspaces (workspace/create 401s). Owned handles therefore
+   * re-attach their child's token, and an adopted handle carries the token
+   * recovered from the instance registry's spawn log (see adoptRunningDsh).
+   * Tokenless handles stay tokenless: older runtimes print no token.
+   */
+  _reuseHandle(host, port, adoptedToken = null) {
     const owned = Boolean(
       this._child
       && this._ownedServer
@@ -505,12 +514,21 @@ class ServerManager {
       && this._ownedServer.host === host
       && this._ownedServer.port === port
     );
+    const authToken = owned
+      ? (typeof this._ownedServer.authToken === 'string' && this._ownedServer.authToken.length > 0
+        ? this._ownedServer.authToken
+        : null)
+      : (typeof adoptedToken === 'string' && adoptedToken.length > 0 ? adoptedToken : null);
     return {
       url: `http://${host}:${port}`,
       host,
       port,
       pid: owned ? this._child.pid : null,
       owned,
+      ...(authToken ? {
+        authToken,
+        authUrl: `http://${host}:${port}/?token=${encodeURIComponent(authToken)}`,
+      } : {}),
     };
   }
 
@@ -524,6 +542,17 @@ class ServerManager {
    * unreachable / non-DSH / probing fails. Status is emitted through the
    * same lifecycle channel as ensureServer().
    *
+   * dsh 0.1.2+ fences the web app and every /api route behind a browser
+   * cookie minted from the launch token, so a tokenless probe classifies a
+   * HEALTHY fenced instance as not-DSH (401). When the tokenless probe finds
+   * a reachable non-DSH endpoint, the launch token is recovered from the
+   * instance registry — the owning window records each spawn's log next to
+   * the registry, and that log carries the `dsh web: …/?token=…` ready line —
+   * and the probe is retried with it. Adopting WITH the token matters twice:
+   * the probe then recognizes the fenced instance at all, and the returned
+   * handle carries authToken so the sidebar's workspace binding (workspace/
+   * create, session/list) can authenticate instead of failing with 401.
+   *
    * When `options.registryFile` is given and this manager carries an owner
    * identity, the adoption is recorded in the registry entry of the adopted
    * instance (attachers list) — the spawning window's exit path and the
@@ -534,17 +563,29 @@ class ServerManager {
    * @param {number} port - DSH endpoint port.
    * @param {object} [options]
    * @param {string|null} [options.registryFile] - Instance registry path for
-   *   adopter bookkeeping; null (default) keeps the legacy no-bookkeeping behavior.
+   *   adopter bookkeeping and launch-token recovery; null (default) keeps the
+   *   legacy no-bookkeeping behavior.
    * @returns {Promise<object|null>} RunningServer handle, or null.
    */
   async adoptRunningDsh(host, port, { registryFile = null } = {}) {
     try {
       this._emit('probing', 'Probing DSH service: http://{host}:{port}…', { host, port });
-      const result = await this.probeWithRetry(host, port);
+      let result = await this.probeWithRetry(host, port);
+      let token = null;
+      if (result && result.reachable && !result.isDsh) {
+        // Reachable but not recognized: on dsh 0.1.2+ this is the auth fence
+        // answering 401. Retry with the owning window's launch token.
+        token = ServerManager._launchTokenFromRegistry(registryFile, host, port);
+        if (token) {
+          const withToken = await this.probeWithRetry(host, port, { token });
+          if (withToken && withToken.reachable && withToken.isDsh) result = withToken;
+          else token = null; // token rejected: do not attach it to the handle
+        }
+      }
       if (result && result.reachable && result.isDsh) {
         this._emit('reusing', 'Found a running DSH instance at http://{host}:{port}, reusing', { host, port });
-        this._startHealthWatch(host, port);
-        const handle = this._reuseHandle(host, port);
+        this._startHealthWatch(host, port, token);
+        const handle = this._reuseHandle(host, port, token);
         if (!handle.owned) {
           ServerManager._registerAdopter(registryFile, {
             port,
@@ -558,6 +599,58 @@ class ServerManager {
       // The caller keeps its original error and decides whether to surface it.
     }
     return null;
+  }
+
+  /**
+   * Recover the launch token of the DSH instance serving host:port from the
+   * instance registry: the entry recorded by the owning window points at the
+   * child's spawn log, whose ready line carries `dsh web: …/?token=…`. Null
+   * when no live entry has a readable log (e.g. a `dsh web` started manually
+   * in a terminal) — such instances stay unadoptable on fenced runtimes.
+   */
+  static _launchTokenFromRegistry(registryFile, host, port) {
+    if (!registryFile) return null;
+    const entries = ServerManager._readRegistryRaw(registryFile);
+    const entry = entries.find((e) => e
+      && e.port === port
+      && (!e.host || e.host === host)
+      && typeof e.log === 'string'
+      && e.log.length > 0
+      && ServerManager._isProcessAlive(e.pid));
+    if (!entry) return null;
+    return ServerManager.launchTokenFromSpawnLog(entry.log);
+  }
+
+  /**
+   * Tail (last `maxBytes` bytes) of a log file, or '' when missing/unreadable.
+   */
+  static _readLogTail(logPath, maxBytes = 8192) {
+    if (typeof logPath !== 'string' || logPath.length === 0) return '';
+    try {
+      const stat = fs.statSync(logPath);
+      const start = Math.max(0, stat.size - maxBytes);
+      const fd = fs.openSync(logPath, 'r');
+      try {
+        const buffer = Buffer.alloc(stat.size - start);
+        fs.readSync(fd, buffer, 0, buffer.length, start);
+        return buffer.toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Launch token printed by dsh 0.1.2+ in its ready line
+   * (`dsh web: http://…/?token=…`) inside the given spawn log. Null on older
+   * runtimes (plain URL), truncated logs, and unreadable files.
+   */
+  static launchTokenFromSpawnLog(logPath) {
+    const match = /^dsh web: (\S+)\s*$/m.exec(ServerManager._readLogTail(logPath));
+    if (!match) return null;
+    return tokenFromUrl(match[1]);
   }
 
   /**
@@ -663,11 +756,11 @@ class ServerManager {
    * when DSH is busy (e.g. streaming a reply) and a single probe would time
    * out.
    */
-  async probeWithRetry(host, port, { attempts = 3, delayMs = 400 } = {}) {
+  async probeWithRetry(host, port, { attempts = 3, delayMs = 400, token = null } = {}) {
     const n = Math.max(1, attempts); // at least one attempt, even for 0/negative input
     let last = null;
     for (let i = 0; i < n; i++) {
-      last = await this.probe(host, port);
+      last = await this.probe(host, port, token === null ? {} : { token });
       if (last.reachable) return last;
       if (i < n - 1) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -750,10 +843,18 @@ class ServerManager {
     }
     // Step 1: a repeated ensure in this extension host keeps ownership of its
     // own child, including when that child lives on a scanned-forward port.
+    // The own-child probe MUST carry the launch token: dsh 0.1.2+ answers a
+    // tokenless probe with 401, which would misclassify the healthy child as
+    // "no longer serving DSH" and kill + respawn it on every repeated ensure
+    // (killing in-flight sessions and workspace binds with it).
     if (autoStart && this._child && this._ownedServer && this._ownedServer.host === host) {
       const own = this._ownedServer;
       this._emit('probing', 'Probing DSH service: http://{host}:{port}…', { host, port: own.port });
-      const ownProbe = await this.probeWithRetry(host, own.port);
+      const ownProbe = await this.probeWithRetry(
+        host,
+        own.port,
+        typeof own.authToken === 'string' && own.authToken.length > 0 ? { token: own.authToken } : {}
+      );
       this._throwIfCancelled(generation);
       if (ownProbe.isDsh) return this._reuseHandle(host, own.port);
       // A child that no longer serves DSH must not be left behind while a
@@ -1273,29 +1374,11 @@ class ServerManager {
    * Null on older runtimes (plain URL) and before the ready line appears.
    */
   _extractLaunchToken() {
-    const tail = this._readLastSpawnLogTail();
-    const match = /^dsh web: (\S+)\s*$/m.exec(tail);
-    if (!match) return null;
-    return tokenFromUrl(match[1]);
+    return ServerManager.launchTokenFromSpawnLog(this._lastSpawnLogPath);
   }
 
   _readLastSpawnLogTail(maxBytes = 8192) {
-    const logPath = this._lastSpawnLogPath;
-    if (typeof logPath !== 'string' || logPath.length === 0) return '';
-    try {
-      const stat = fs.statSync(logPath);
-      const start = Math.max(0, stat.size - maxBytes);
-      const fd = fs.openSync(logPath, 'r');
-      try {
-        const buffer = Buffer.alloc(stat.size - start);
-        fs.readSync(fd, buffer, 0, buffer.length, start);
-        return buffer.toString('utf8');
-      } finally {
-        fs.closeSync(fd);
-      }
-    } catch {
-      return '';
-    }
+    return ServerManager._readLogTail(this._lastSpawnLogPath, maxBytes);
   }
 
   /** Session flag: the current runtime rejected --no-open once already. */
