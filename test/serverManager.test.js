@@ -33,6 +33,24 @@ function close(server) {
   });
 }
 
+/**
+ * Probe a port that must read as free, retrying briefly.
+ *
+ * Closing a listener can leave its port answering ECONNRESET for a moment
+ * (OS/sandbox dependent) before settling into a clean refusal; production
+ * treats both as "not a DSH answer", so the strict `refused` assertions here
+ * wait for the transient state to pass instead of racing it.
+ */
+async function waitForRefused(manager, port, attempts = 20) {
+  let last = null;
+  for (let i = 0; i < attempts; i += 1) {
+    last = await manager.probe('127.0.0.1', port);
+    if (last && last.reason === 'refused') return last;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return last;
+}
+
 test('probe recognizes a fragmented boot marker over raw HTTP/TCP', async (t) => {
   const server = net.createServer((socket) => {
     socket.once('data', () => {
@@ -107,7 +125,7 @@ test('ServerManager preserves the standalone self-test behavior', async (t) => {
     { reachable: true, isDsh: false }
   );
   assert.deepStrictEqual(
-    await manager.probe('127.0.0.1', closedPort),
+    await waitForRefused(manager, closedPort),
     { reachable: false, reason: 'refused' }
   );
   assert.strictEqual(await manager.healthCheck(`http://127.0.0.1:${dshPort}/`), true);
@@ -118,8 +136,8 @@ test('ServerManager preserves the standalone self-test behavior', async (t) => {
     freePort > plainPort && freePort <= plainPort + SELF_TEST_PORT_SCAN_LIMIT,
     `free=${freePort}`
   );
-  assert.strictEqual((await manager.probe('127.0.0.1', freePort)).reachable, false);
-  assert.strictEqual((await manager.probe('127.0.0.1', freePort)).reason, 'refused');
+  assert.strictEqual((await waitForRefused(manager, freePort)).reachable, false);
+  assert.strictEqual((await waitForRefused(manager, freePort)).reason, 'refused');
 
   const statuses = [];
   const reuseManager = new ServerManager({ onStatus: (status) => statuses.push(status.state) });
@@ -1174,6 +1192,106 @@ test('adoptRunningDsh still refuses a fenced instance without a recoverable toke
     null,
     'no registry entry → no token → the fenced instance stays unadoptable'
   );
+});
+
+// Live bug 2026-09-18 (multi-window sharing): Step A of shared-instance mode
+// was gated on `isDsh`, which a tokenless probe of a HEALTHY fenced instance
+// never reports — so a sibling window could not adopt the running shared
+// instance and spawned a second one (3081 + 3082 in one WSL environment).
+
+test('shared environment mode adopts a fenced shared instance through the registry token', async (t) => {
+  const fenced = createFencedDshServer('SECRET-TOKEN');
+  await listen(fenced);
+  const port = fenced.address().port;
+  t.after(() => close(fenced));
+
+  const file = path.join(os.tmpdir(), `dsh-shared-fenced-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: process.pid, port, host: '127.0.0.1', cwd: null, at: Date.now(), authToken: 'SECRET-TOKEN' },
+  ], null, 2));
+  t.after(() => fs.rmSync(file, { force: true }));
+
+  const manager = new NoSpawnManager();
+  t.after(() => manager.stop());
+  const handle = await manager.ensureServer({
+    host: '127.0.0.1', port, autoStart: true, cwd: null, registryFile: file, shareMode: 'environment',
+    discoverDshWebPorts: async () => [],
+  });
+
+  assert.strictEqual(manager.spawnBranch, false, 'a reachable fenced instance must be adopted, not spawned past');
+  assert.strictEqual(handle.owned, false);
+  assert.strictEqual(handle.port, port);
+  assert.strictEqual(handle.authToken, 'SECRET-TOKEN', 'the adopted handle must authenticate the API');
+  assert.strictEqual(handle.managed, true,
+    'an instance recorded by this extension is extension bookkeeping, not the user’s');
+  assert.strictEqual(handle.pid, process.pid, 'the adopted handle carries the registry pid');
+});
+
+test('an adopted instance the registry does not know is not marked managed', async (t) => {
+  const dshServer = createDshHttpServer();
+  await listen(dshServer);
+  const port = dshServer.address().port;
+  t.after(() => close(dshServer));
+
+  const file = path.join(os.tmpdir(), `dsh-shared-foreign-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(file, '[]');
+  t.after(() => fs.rmSync(file, { force: true }));
+
+  const manager = new NoSpawnManager();
+  t.after(() => manager.stop());
+  const handle = await manager.ensureServer({
+    host: '127.0.0.1', port, autoStart: true, cwd: null, registryFile: file, shareMode: 'environment',
+  });
+
+  // A plain `dsh web` the user started themselves: adopted, but its workspace
+  // registration still goes through the consent gate.
+  assert.strictEqual(handle.managed, undefined);
+  assert.strictEqual(handle.pid, null);
+});
+
+test('_launchTokenFromRegistry prefers the recorded token over the spawn log', (t) => {
+  const logFile = path.join(os.tmpdir(), `dsh-pref-log-${process.pid}-${Date.now()}.log`);
+  fs.writeFileSync(logFile, 'dsh web: http://127.0.0.1:3080/?token=LOG-TOKEN\n');
+  t.after(() => fs.rmSync(logFile, { force: true }));
+
+  const file = path.join(os.tmpdir(), `dsh-pref-reg-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: process.pid, port: 3080, host: '127.0.0.1', authToken: 'REGISTRY-TOKEN', log: logFile },
+  ], null, 2));
+  assert.strictEqual(ServerManager._launchTokenFromRegistry(file, '127.0.0.1', 3080), 'REGISTRY-TOKEN');
+
+  // Legacy entry: no token field, the spawn log is the only source.
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: process.pid, port: 3080, host: '127.0.0.1', log: logFile },
+  ], null, 2));
+  assert.strictEqual(ServerManager._launchTokenFromRegistry(file, '127.0.0.1', 3080), 'LOG-TOKEN');
+
+  // Dead entry: another window's exited instance must never hand out a token.
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: 2147483646, port: 3080, host: '127.0.0.1', authToken: 'REGISTRY-TOKEN', log: logFile },
+  ], null, 2));
+  assert.strictEqual(ServerManager._launchTokenFromRegistry(file, '127.0.0.1', 3080), null);
+});
+
+test('ready registry entries record the launch token and the file is private', (t) => {
+  const file = path.join(os.tmpdir(), `dsh-token-reg-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  const manager = new ServerManager();
+  manager._finalizeReady('127.0.0.1', 4324, '/ws', 98767, file, null, 'SECRET-TOKEN');
+  const entry = JSON.parse(fs.readFileSync(file, 'utf8'))[0];
+  assert.strictEqual(entry.authToken, 'SECRET-TOKEN',
+    'a sibling window must be able to adopt this instance without reading the spawn log');
+  if (process.platform !== 'win32') {
+    assert.strictEqual(fs.statSync(file).mode & 0o777, 0o600,
+      'the registry carries a live credential and must stay owner-only');
+  }
+
+  // A tokenless runtime (dsh < 0.1.2) records no token key at all.
+  const file2 = path.join(os.tmpdir(), `dsh-notoken-reg-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file2, { force: true }));
+  manager._finalizeReady('127.0.0.1', 4325, null, 98768, file2, null);
+  assert.strictEqual('authToken' in JSON.parse(fs.readFileSync(file2, 'utf8'))[0], false);
 });
 
 test('launchTokenFromSpawnLog extracts the token and tolerates missing files', (t) => {

@@ -253,6 +253,63 @@ test('reused + workspace missing when consent is declined rolls the creation bac
   });
 });
 
+test('adopted shared instance (managed) binds without consent, like an owned child', async () => {
+  // Shared-instance mode: a sibling VS Code window of the same environment
+  // spawned the DSH and this window adopted it (owned:false, managed:true).
+  // Prompting here made shared instances effectively unbindable — a decline
+  // rolled the registration back on every folder switch (live bug 2026-09-18).
+  const api = createApi({ workspaces: [], sessions: [] });
+  let consentCalls = 0;
+  const binding = makeBinding(api, {
+    requestConsent: async () => { consentCalls += 1; return true; },
+  });
+  const sessionId = await binding.resolve(
+    { url: BASE_URL, owned: false, managed: true, pid: 4242 },
+    'D:\\shared'
+  );
+
+  assert.strictEqual(consentCalls, 0, 'the extension’s own shared instance needs no consent');
+  assert.strictEqual(sessionId, 'w-new-session');
+  assert.strictEqual(binding.state().state, BINDING_STATES.BOUND);
+  // `owned` keeps meaning "this window owns the child process".
+  assert.strictEqual(binding.state().owned, false);
+  assert.deepStrictEqual(api.calls, {
+    workspaceCreate: 1,
+    workspaceDelete: 0,
+    sessionList: 1,
+    sessionCreate: 1,
+  });
+});
+
+test('a genuinely user-managed server still asks for consent', async () => {
+  const api = createApi({ workspaces: [], sessions: [] });
+  let consentCalls = 0;
+  const binding = makeBinding(api, {
+    requestConsent: async () => { consentCalls += 1; return false; },
+  });
+  // Adopted from a `dsh web` the user started: no registry entry, so no
+  // managed marker and no pid.
+  const sessionId = await binding.resolve({ url: BASE_URL, owned: false }, 'D:\\user-managed');
+
+  assert.strictEqual(consentCalls, 1);
+  assert.strictEqual(sessionId, null);
+});
+
+test('an adopted instance is identified by pid, so a replacement on the same port rebinds', async () => {
+  const api = createApi({
+    workspaces: [],
+    sessions: [],
+  });
+  const binding = makeBinding(api);
+  const s1 = await binding.resolve({ url: BASE_URL, owned: false, managed: true, pid: 111 }, 'D:\\work');
+  assert.ok(s1);
+  // The shared instance died and its replacement listens on the configured
+  // port again: a url-only identity would serve the dead instance's session.
+  const s2 = await binding.resolve({ url: BASE_URL, owned: false, managed: true, pid: 222 }, 'D:\\work');
+  assert.ok(s2);
+  assert.strictEqual(api.calls.workspaceCreate, 2, 'the cache must not answer for a new process');
+});
+
 test('reused + declined rollback failure still leaves the binding unbound', async () => {
   const api = createApi({
     workspaces: [],

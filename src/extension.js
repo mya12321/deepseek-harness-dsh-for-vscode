@@ -102,6 +102,7 @@ const {
   diagnosticSnapshot,
 } = require("./providerDetector");
 const { writeCleanOverlay, writeEmbedOverlay } = require("./embedOverlay");
+const { startEmbedProxy } = require("./embedProxy");
 const {
   HOME_MODES,
   bindRuntimeHome,
@@ -127,6 +128,7 @@ const dshApiFetch = createAuthedFetch({
   tokenProvider: () => (currentServer && typeof currentServer.authToken === 'string' ? currentServer.authToken : null),
 });
 let currentExternalUrl = null; // client-reachable URL (forwarded in remote workspaces)
+let currentBrowserUrl = null; // direct client-reachable DSH URL (token intact) for "open in browser"
 let currentSessionId = null; // DSH session id to pass to the iframe (dsh_session)
 let currentDshTheme = null; // active VS Code theme ('dark'|'light') for dsh_theme / dshThemeChanged
 let currentView = null; // vscode.WebviewView | null
@@ -202,6 +204,7 @@ let instanceSeq = 0; // R16: monotonically increasing instance counter
 let lastFocusedInstanceId = null; // R16: most recently focused DSH surface (null = sidebar)
 let interactionHandlers = []; // webview interaction routers registered by L1/L2 features
 let cleanMode = false; // D1 clean-restart mode: spawns with vscode-clean.overlay.yml
+let embedProxyState = null; // SM-3 { key, proxy } authenticating proxy for fenced embedded UIs
 let cleanPatchPath = null; // absolute clean overlay currently in effect
 let pendingCleanRestart = false; // status-page Retry maps to Restart-Clean on HEALTH_TIMEOUT/SPAWN_EXITED_EARLY
 let selfHealEvents = []; // Diagnose records successful patch-drop self-heal retries here
@@ -271,11 +274,13 @@ async function openInstancePanel({
     panel.dispose();
     throw error;
   }
-  const externalUrl = await externalize(server.authUrl || server.url);
+  const externalUrl = await externalize(await embeddedUrlFor(server));
+  const browserUrl = await externalize(server.authUrl || server.url);
   const sessionValue = sessionIdFromValue(sessionId);
   const paint = () => {
     panel.webview.html = framePage({
       url: externalUrl,
+      browserUrl,
       lang: facade.env.language,
       failText: loc("Failed to load: DSH service unreachable"),
       openBrowserLabel: loc("Open in browser"),
@@ -685,6 +690,74 @@ async function externalize(url) {
   }
 }
 
+/**
+ * Resolve the URL an embedded DSH surface (sidebar iframe, instance panels)
+ * should load for one server handle.
+ *
+ * Fenced runtimes (dsh 0.1.2+, i.e. handles carrying a launch token) cannot be
+ * embedded directly: their browser credential is a `SameSite=Strict` cookie,
+ * which a `vscode-webview://` cross-site iframe can never send, and the
+ * tokened URL variant only redirects to a clean `/` (dropping `dsh_session` /
+ * `dsh_embed` / `dsh_theme`). Such servers are embedded through the extension
+ * host's authenticating loopback proxy instead — see src/embedProxy.js. The
+ * proxy is reused while the server URL and token are unchanged and replaced
+ * when either moves (restart, port-conflict fallback, re-adoption).
+ *
+ * Unfenced runtimes keep the historical direct URL, so older dsh builds are
+ * untouched.
+ *
+ * @param {object} server - RunningServer handle.
+ * @returns {Promise<string>} URL to embed (not yet externalized).
+ */
+async function embeddedUrlFor(server) {
+  const token = server && typeof server.authToken === 'string' ? server.authToken : '';
+  if (!server || token.length === 0) {
+    return (server && server.url) || '';
+  }
+  const key = `${server.url}#${token}`;
+  if (embedProxyState && embedProxyState.key === key) {
+    return embedProxyState.proxy.url;
+  }
+  closeEmbedProxy();
+  try {
+    const startProxy = injectedDependencies.startEmbedProxy || startEmbedProxy;
+    const proxy = await startProxy({
+      upstreamUrl: server.url,
+      token,
+      fetchImpl: dshApiFetch,
+      log: (message) => appendDiagnostic(`[embed-proxy] ${message}`),
+    });
+    embedProxyState = { key, proxy };
+    return proxy.url;
+  } catch (err) {
+    // No proxy means no embedded UI on a fenced runtime; the direct URL at
+    // least surfaces dsh's own message instead of hiding the failure.
+    appendDiagnostic(`[embed-proxy] ${err && err.message ? err.message : String(err)}`);
+    return server.authUrl || server.url;
+  }
+}
+
+/** Stop the embedded-UI proxy, if one is running. */
+function closeEmbedProxy() {
+  if (!embedProxyState) return;
+  try {
+    embedProxyState.proxy.close();
+  } catch (_) { /* already closed */ }
+  embedProxyState = null;
+}
+
+/**
+ * Drop the cached embedded URLs and stop the embed proxy. Called wherever the
+ * current server handle stops being usable (restart, explicit stop, server
+ * loss, view close, deactivate) so no loopback listener survives the server it
+ * proxies to.
+ */
+function resetEmbeddedServerUrls() {
+  currentExternalUrl = null;
+  currentBrowserUrl = null;
+  closeEmbedProxy();
+}
+
 function setStatusBar(text, tooltip) {
   if (!statusBar) {
     // The indicator is normally created by the L1 statusbar-basic feature.
@@ -722,6 +795,7 @@ function renderFrame(context) {
   try { changeTree?.setActiveSession?.(currentSessionId); } catch (_) { /* advisory */ }
   render(framePage({
     url: currentExternalUrl,
+    browserUrl: currentBrowserUrl || currentExternalUrl,
     lang: vscode.env.language,
     failText: loc("Failed to load: DSH service unreachable"),
     openBrowserLabel: loc("Open in browser"),
@@ -811,10 +885,14 @@ async function stopOwnedServer({ force = false } = {}) {
 async function bindServer(context, server, cwd) {
   currentServer = server;
   boundCwd = cwd;
-  // dsh 0.1.2+: embed the tokened authUrl so the iframe passes the auth
-  // fence; older servers have no authUrl and externalize their plain URL.
-  const url = await externalize(server.authUrl || server.url);
+  // SM-3: fenced runtimes (dsh 0.1.2+) embed through the extension's
+  // authenticating loopback proxy — a webview iframe cannot carry dsh's
+  // SameSite=Strict cookie; older servers embed their plain URL directly.
+  const url = await externalize(await embeddedUrlFor(server));
   currentExternalUrl = url;
+  // "Open in browser" always targets the DSH server itself (its launch token
+  // is what a real browser needs; the proxy URL is for the sandboxed iframe).
+  currentBrowserUrl = await externalize(server.authUrl || server.url);
   const mode = loc(server.owned ? "managed" : "reused");
   // A6/U9: when the port-conflict fallback moved the server off the
   // configured port, the tooltip says which port is actually in use.
@@ -1007,6 +1085,7 @@ async function connectNow(context) {
     const cfg = hostContext.config();
     const url = "http://" + cfg.host + ":" + resolveEndpointPort(cfg);
     currentExternalUrl = safeHttpUrl(url) === "about:blank" ? null : await externalize(url);
+    currentBrowserUrl = null; // no bound server: the endpoint above IS the browser target
     const cleanEligible = isCleanRestartEligible(err);
     pendingCleanRestart = cleanEligible;
     appendDiagnostic(`[startup] ${renderStartupError(err, loc)}`);
@@ -1055,7 +1134,7 @@ async function reconnectNow(context) {
   }
   await stopOwnedServer({ force: true }); // restart must replace the child even when other windows adopted it
   currentServer = null;
-  currentExternalUrl = null;
+  resetEmbeddedServerUrls();
   currentSessionId = null;
   followEditProjection(null);
   await connectNow(context);
@@ -1137,7 +1216,7 @@ async function rebindToWorkspace(context) {
   // process no longer exists, fall back to the full connect/ensure flow.
   if (!currentServer || (currentServer.owned && !manager.hasOwnedChild())) {
     currentServer = null;
-    currentExternalUrl = null;
+    resetEmbeddedServerUrls();
     currentSessionId = null;
     followEditProjection(null);
     await connectNow(context);
@@ -1505,7 +1584,7 @@ async function setupCoreServer({ context, services }) {
       if (s.state === "error") {
         setStatusBar("$(error) " + (s.message ? loc(s.message, s.params) : loc("DSH: unavailable")));
         currentServer = null;
-        currentExternalUrl = null;
+        resetEmbeddedServerUrls();
         currentSessionId = null;
         followEditProjection(null);
         boundCwd = null;
@@ -1867,7 +1946,10 @@ async function setupCoreSidebar({ context, services }) {
             // The status page also renders after a failed connect; in that
             // state currentServer is null but currentExternalUrl points at
             // the configured endpoint, so keep this handler usable there.
-            const candidate = currentExternalUrl && safeHttpUrl(currentExternalUrl);
+            // Prefer the direct DSH URL: the embed proxy is for the sandboxed
+            // iframe, while a real browser can hold dsh's auth cookie itself.
+            const candidate = (currentBrowserUrl || currentExternalUrl)
+              && safeHttpUrl(currentBrowserUrl || currentExternalUrl);
             if (candidate && candidate !== "about:blank") {
               vscode.env.openExternal(vscode.Uri.parse(candidate));
             }
@@ -1904,7 +1986,7 @@ async function setupCoreSidebar({ context, services }) {
               if (!shouldStopOnViewClose(hostContext.config().closePolicy)) return;
               if (await stopOwnedServer()) {
                 currentServer = null;
-                currentExternalUrl = null;
+                resetEmbeddedServerUrls();
                 boundCwd = null;
               }
             }).catch(() => {});
@@ -2503,8 +2585,12 @@ function registerFeatureCommands(context, featureOk) {
           vscode.window.showErrorMessage(loc("DSH: unavailable"));
           return;
         }
-        if (currentExternalUrl) {
-          await vscode.env.openExternal(vscode.Uri.parse(currentExternalUrl));
+        // A real browser holds dsh's auth cookie itself, so it opens the
+        // direct (token-carrying) DSH URL; the proxy URL is for the sandboxed
+        // iframe only.
+        const target = currentBrowserUrl || currentExternalUrl;
+        if (target) {
+          await vscode.env.openExternal(vscode.Uri.parse(target));
         }
       });
     }),
@@ -2533,7 +2619,7 @@ function registerFeatureCommands(context, featureOk) {
         }
         await stopOwnedServer({ force: true });
         currentServer = null;
-        currentExternalUrl = null;
+        resetEmbeddedServerUrls();
         currentSessionId = null;
         followEditProjection(null);
         boundCwd = null;
@@ -2673,7 +2759,10 @@ function registerFeatureCommands(context, featureOk) {
         const timer = setTimeout(() => controller.abort(), 6000);
         let items;
         try {
-          items = await listSessions(baseUrl, { signal: controller.signal });
+          // The authed fetch is mandatory: dsh 0.1.2+ answers a tokenless
+          // /api call with 401, so the picker came up empty on every fenced
+          // instance (the sibling command below had it right).
+          items = await listSessions(baseUrl, { signal: controller.signal, fetchImpl: dshApiFetch });
         } finally {
           clearTimeout(timer);
         }
@@ -2716,7 +2805,7 @@ function registerFeatureCommands(context, featureOk) {
             const timer = setTimeout(() => controller.abort(), 6000);
             let items;
             try {
-              items = await listSessions(baseUrl, { signal: controller.signal });
+              items = await listSessions(baseUrl, { signal: controller.signal, fetchImpl: dshApiFetch });
             } finally {
               clearTimeout(timer);
             }
@@ -3165,7 +3254,7 @@ async function deactivate() {
     }
     currentView = null;
     currentServer = null;
-    currentExternalUrl = null;
+    resetEmbeddedServerUrls();
     currentSessionId = null;
     // C2.5: stop the edit-event projection subscription (if any).
     try {

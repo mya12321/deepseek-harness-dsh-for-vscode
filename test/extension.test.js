@@ -749,6 +749,97 @@ test('workspace rebind resolves through binding without stopping the owned child
   await deactivate();
 });
 
+test('a fenced runtime embeds through the loopback proxy while the browser link keeps the token URL', async () => {
+  const fake = createFakeVscode({ autoStart: true });
+  fake.api.workspace.workspaceFolders = [
+    { uri: { fsPath: 'D:\\a' }, name: 'a', index: 0 },
+  ];
+  const context = {
+    globalStorageUri: { fsPath: path.join(os.tmpdir(), `dsh-extension-test-embed-proxy-${process.pid}`) },
+    subscriptions: [],
+  };
+  const fakeBinding = {
+    async resolve() { return 'sid-a'; },
+    async refresh() { return 'sid-a'; },
+    dispose() {},
+    state() {
+      return { state: 'bound', cwd: 'D:\\a', workspaceId: 'w-1', sessionId: 'sid-a', owned: true, error: null, at: 0 };
+    },
+  };
+  const serverHandle = {
+    url: 'http://127.0.0.1:3080',
+    host: '127.0.0.1',
+    port: 3080,
+    pid: 4242,
+    owned: true,
+    authToken: 'SECRET-TOKEN', // allow-secret-scan (test fixture)
+    authUrl: 'http://127.0.0.1:3080/?token=SECRET-TOKEN', // allow-secret-scan (test fixture)
+  };
+  const manager = {
+    setResolvedRuntime() {},
+    ensureServer() { return Promise.resolve(serverHandle); },
+    hasOwnedChild() { return true; },
+    cancelPending() {},
+    async stop() {},
+  };
+  const proxyCalls = [];
+  const fakeProxy = {
+    url: 'http://127.0.0.1:4999/?dsh_gate=embed-capability',
+    origin: 'http://127.0.0.1:4999',
+    port: 4999,
+    close() { proxyCalls.push('close'); },
+  };
+
+  await activateWithDependencies(context, {
+    vscode: fake.api,
+    async startTextDocumentBridge() { return { env: {}, async close() {} }; },
+    async startVersionedBridge() { return { env: {}, async close() {} }; },
+    createServerManager() { return manager; },
+    createWorkspaceBinding() { return fakeBinding; },
+    async ensureManagedRuntime() { return {}; },
+    async startEmbedProxy(options) {
+      proxyCalls.push(options);
+      return fakeProxy;
+    },
+  });
+
+  let viewHtml = '';
+  const view = {
+    webview: {
+      options: null,
+      onDidReceiveMessage() { return disposable(); },
+      set html(value) { viewHtml = value; },
+      get html() { return viewHtml; },
+    },
+    onDidDispose() { return disposable(); },
+  };
+  fake.registrations.webview.provider.resolveWebviewView(view);
+  await waitFor(() => viewHtml.includes('dsh_session=sid-a'));
+
+  assert.strictEqual(proxyCalls.length, 1, 'a fenced runtime must be proxied exactly once');
+  assert.strictEqual(proxyCalls[0].upstreamUrl, 'http://127.0.0.1:3080');
+  assert.strictEqual(proxyCalls[0].token, 'SECRET-TOKEN');
+  const frameSrc = /<iframe id="frame" src="([^"]+)"/.exec(viewHtml);
+  assert.ok(frameSrc, 'the frame page must embed an iframe');
+  assert.ok(
+    frameSrc[1].startsWith('http://127.0.0.1:4999/'),
+    `the iframe must load the proxy origin, got ${frameSrc[1]}`
+  );
+  assert.ok(!frameSrc[1].includes('token='), 'the launch token must never enter the iframe URL');
+  assert.ok(
+    frameSrc[1].includes('dsh_gate=embed-capability'),
+    `the embed capability must ride the iframe URL, got ${frameSrc[1]}`
+  );
+  assert.ok(frameSrc[1].includes('dsh_session=sid-a'), 'session markers still ride the proxy URL');
+  assert.ok(
+    viewHtml.includes('href="http://127.0.0.1:3080/?token=SECRET-TOKEN"'),
+    'the open-in-browser link must keep the direct tokened DSH URL'
+  );
+
+  await deactivate();
+  assert.ok(proxyCalls.includes('close'), 'deactivate must stop the embed proxy');
+});
+
 test('binding API failure renders error status page and does not keep the old iframe session', async () => {
   const fake = createFakeVscode({ autoStart: true });
   fake.api.workspace.workspaceFolders = [

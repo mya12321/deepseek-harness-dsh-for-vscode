@@ -503,10 +503,25 @@ class ServerManager {
    * the launch token, so a handle without the token can serve an iframe but
    * CANNOT bind workspaces (workspace/create 401s). Owned handles therefore
    * re-attach their child's token, and an adopted handle carries the token
-   * recovered from the instance registry's spawn log (see adoptRunningDsh).
+   * recovered from the instance registry (see adoptRunningDsh).
    * Tokenless handles stay tokenless: older runtimes print no token.
+   *
+   * `adoption` describes an instance adopted from the registry (see
+   * _managedEntryFromRegistry): `pid` is the adopted child's process id, and
+   * `managed: true` marks it as started by this extension — by another VS Code
+   * window of the same environment — rather than by the user. Consumers use
+   * that to treat it as extension bookkeeping (workspace binding skips its
+   * consent gate for it) while still reporting `owned: false`, which keeps
+   * meaning "this window does not own the child process".
+   *
+   * @param {string} host - DSH endpoint host.
+   * @param {number} port - DSH endpoint port.
+   * @param {string|null} [adoptedToken] - Launch token of the adopted child.
+   * @param {{pid?: number|null, managed?: boolean}|null} [adoption] - Registry
+   *   facts about the adopted child; null for a foreign instance.
+   * @returns {object} RunningServer handle.
    */
-  _reuseHandle(host, port, adoptedToken = null) {
+  _reuseHandle(host, port, adoptedToken = null, adoption = null) {
     const owned = Boolean(
       this._child
       && this._ownedServer
@@ -519,12 +534,14 @@ class ServerManager {
         ? this._ownedServer.authToken
         : null)
       : (typeof adoptedToken === 'string' && adoptedToken.length > 0 ? adoptedToken : null);
+    const adoptedPid = adoption && Number.isInteger(adoption.pid) ? adoption.pid : null;
     return {
       url: `http://${host}:${port}`,
       host,
       port,
-      pid: owned ? this._child.pid : null,
+      pid: owned ? this._child.pid : adoptedPid,
       owned,
+      ...(!owned && adoption && adoption.managed === true ? { managed: true } : {}),
       ...(authToken ? {
         authToken,
         authUrl: `http://${host}:${port}/?token=${encodeURIComponent(authToken)}`,
@@ -585,7 +602,10 @@ class ServerManager {
       if (result && result.reachable && result.isDsh) {
         this._emit('reusing', 'Found a running DSH instance at http://{host}:{port}, reusing', { host, port });
         this._startHealthWatch(host, port, token);
-        const handle = this._reuseHandle(host, port, token);
+        const managedEntry = ServerManager._managedEntryFromRegistry(registryFile, host, port);
+        const handle = this._reuseHandle(host, port, token, managedEntry
+          ? { pid: managedEntry.pid, managed: true }
+          : null);
         if (!handle.owned) {
           ServerManager._registerAdopter(registryFile, {
             port,
@@ -602,10 +622,37 @@ class ServerManager {
   }
 
   /**
+   * Registry entry of the live instance serving host:port, or null.
+   *
+   * A live entry here means the instance was started by this extension — the
+   * registry lives in the extension's own globalStorage and is written only by
+   * the spawn path — so an adopting window can treat it as extension
+   * bookkeeping instead of a service the user runs. No owner-marker check:
+   * entries written by older versions of this extension carry no vscodePid but
+   * are just as much ours (the same reading sweepDeadOwnerEntries applies).
+   */
+  static _managedEntryFromRegistry(registryFile, host, port) {
+    if (!registryFile) return null;
+    return ServerManager._readRegistryRaw(registryFile).find((e) => e
+      && e.port === port
+      && (!e.host || e.host === host)
+      && Number.isInteger(e.pid)
+      && ServerManager._isProcessAlive(e.pid)) || null;
+  }
+
+  /**
    * Recover the launch token of the DSH instance serving host:port from the
-   * instance registry: the entry recorded by the owning window points at the
-   * child's spawn log, whose ready line carries `dsh web: …/?token=…`. Null
-   * when no live entry has a readable log (e.g. a `dsh web` started manually
+   * instance registry. Two sources, in order:
+   *
+   *   1. `entry.authToken` — recorded by the owning window at spawn time
+   *      (see _finalizeReady). This is the durable one: it survives log
+   *      rotation, log cleanup, and a moved/renamed log directory.
+   *   2. `entry.log` — the child's spawn log, whose ready line carries
+   *      `dsh web: …/?token=…`. Kept for entries written by older versions
+   *      of this extension (and for a window that spawned before an upgrade
+   *      in the same session).
+   *
+   * Null when no live entry carries either (e.g. a `dsh web` started manually
    * in a terminal) — such instances stay unadoptable on fenced runtimes.
    */
   static _launchTokenFromRegistry(registryFile, host, port) {
@@ -614,11 +661,13 @@ class ServerManager {
     const entry = entries.find((e) => e
       && e.port === port
       && (!e.host || e.host === host)
-      && typeof e.log === 'string'
-      && e.log.length > 0
       && ServerManager._isProcessAlive(e.pid));
     if (!entry) return null;
-    return ServerManager.launchTokenFromSpawnLog(entry.log);
+    if (typeof entry.authToken === 'string' && entry.authToken.length > 0) return entry.authToken;
+    if (typeof entry.log === 'string' && entry.log.length > 0) {
+      return ServerManager.launchTokenFromSpawnLog(entry.log);
+    }
+    return null;
   }
 
   /**
@@ -934,8 +983,17 @@ class ServerManager {
   }) {
     this._throwIfCancelled(generation);
 
-    // Step A: adopt the DSH answering on the configured port.
-    if (probeResult.reachable && probeResult.isDsh) {
+    // Step A: adopt whatever answers on the configured port.
+    //
+    // The gate is `reachable`, NOT `isDsh`: on dsh 0.1.2+ a tokenless probe of
+    // a HEALTHY fenced instance answers 401 and is classified not-DSH, so an
+    // isDsh gate skipped adoption for exactly the instances this mode exists
+    // to share (live bug 2026-09-18: two windows of one WSL environment each
+    // spawned their own DSH, 3081 and 3082). adoptRunningDsh retries the probe
+    // with the launch token recovered from the instance registry and returns
+    // null for a genuinely foreign endpoint, which falls through to Step B/C
+    // unchanged.
+    if (probeResult.reachable) {
       const adopted = await this.adoptRunningDsh(host, port, { registryFile });
       if (adopted) return adopted;
     }
@@ -1137,11 +1195,26 @@ class ServerManager {
     );
   }
 
-  /** Best-effort write of the registry array (creates the parent directory). */
+  /**
+   * Best-effort write of the registry array (creates the parent directory).
+   *
+   * Mode 0600: entries carry the instance's launch token (see _finalizeReady)
+   * and its spawn-log path, either of which is enough to drive the instance's
+   * authenticated API. Only the owning user's own VS Code windows ever read
+   * this file, so there is no reader to lose. The mode is applied at creation
+   * and re-asserted on every write (an existing file keeps its old mode
+   * otherwise); on Windows the mode argument is ignored, which the platform's
+   * per-user profile ACLs already cover.
+   */
   static _writeRegistry(registryFile, entries) {
     try {
       fs.mkdirSync(path.dirname(path.resolve(registryFile)), { recursive: true });
-      fs.writeFileSync(registryFile, JSON.stringify(entries, null, 2) + '\n');
+      fs.writeFileSync(registryFile, JSON.stringify(entries, null, 2) + '\n', { mode: 0o600 });
+      try {
+        fs.chmodSync(registryFile, 0o600);
+      } catch {
+        // non-POSIX filesystem (or an unsupported mode): best-effort only
+      }
     } catch {
       // registry persistence is best-effort bookkeeping
     }
@@ -1399,7 +1472,13 @@ class ServerManager {
       try {
         const server = await this._spawnAttempt(host, port, cwd, registryFile, generation, false);
         this._selfHealCount += 1;
-        this._emit('selfheal', 'DSH exited early with --patch; retried without --patch');
+        // The consequence is the point: the --patch overlay is what inserts
+        // the dsh-vscode-integration plugin, and without it nothing consumes
+        // the iframe's dsh_session marker — every embedded surface boots the
+        // DSH app with its own auto-selected workspace instead of the window's
+        // bound one ("newly opened window's workspace never binds"). Naming
+        // that here keeps the degradation from being invisible in Diagnose.
+        this._emit('selfheal', 'DSH exited early with --patch; retried without --patch — the instance now runs WITHOUT the dsh-vscode-integration plugin (dsh_session follow, theme/clipboard bridges inactive)');
         return server;
       } catch (err2) {
         // No second retry: the original SPAWN_EXITED_EARLY code stands.
@@ -1572,6 +1651,15 @@ class ServerManager {
         windowId: this.ownerWindowId,
         at: Date.now(),
         ...(logPath ? { log: logPath } : {}),
+        // Cross-window sharing on dsh 0.1.2+: the launch token is what makes a
+        // fenced instance adoptable at all (a tokenless probe answers 401, so
+        // a sibling window cannot even recognize the instance, let alone bind
+        // a workspace to it). The spawn log holds the same token in its ready
+        // line, but a token here survives log rotation/cleanup and needs no
+        // tail read. It is the same secret either way — this registry already
+        // records the log path, whose ready line carries the token verbatim —
+        // so nothing new is exposed; _writeRegistry keeps the file at 0600.
+        ...(authToken ? { authToken } : {}),
       });
     }
     // The plain URL stays canonical for every internal consumer; the tokened

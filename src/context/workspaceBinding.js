@@ -12,14 +12,22 @@ const path = require("node:path");
  * changes.
  *
  * 0.1.5 dropped `workspace.list`, so registration is create-or-adopt:
- * `workspace.create` returns `{ workspace, created }`. On an owned server a
- * miss simply registers; on a non-owned (user-managed) server a `created:
- * true` answer means the extension JUST registered a workspace the user did
- * not see coming, so the consent gate fires and a decline ROLLS THE CREATION
- * BACK with `workspace.delete` (safe: the root session is created only after
- * binding, so the fresh workspace holds no sessions yet). A pre-existing
+ * `workspace.create` returns `{ workspace, created }`. On a server this
+ * extension runs a miss simply registers; on a genuinely user-managed server a
+ * `created: true` answer means the extension JUST registered a workspace the
+ * user did not see coming, so the consent gate fires and a decline ROLLS THE
+ * CREATION BACK with `workspace.delete` (safe: the root session is created only
+ * after binding, so the fresh workspace holds no sessions yet). A pre-existing
  * workspace (`created: false`) proceeds silently - no prompt regression on
  * every reload.
+ *
+ * "Runs" covers two handle shapes: `owned` (this window spawned the child) and
+ * `managed` (a sibling window of the same OS environment did, and this window
+ * adopted it in shared-instance mode). Both are the extension's own
+ * bookkeeping; gating the second on consent made a shared instance effectively
+ * unbindable - the prompt was answered away or declined, and a decline rolled
+ * the registration back every time. Only a server neither window started (the
+ * user's own `dsh web`, adopted with autoStart off) still prompts.
  */
 
 const { listSessions, createSession } = require("../sessionNavigation");
@@ -148,15 +156,20 @@ function createWorkspaceBinding({
    * session that no longer exists there — the sidebar then loads a dead
    * dsh_session and the workspace silently fails to bind.
    *
+   * The pid is part of the identity whenever it is known - owned or adopted
+   * from the instance registry alike. The port is the one thing that DOES
+   * repeat: a dead shared instance is replaced on the same configured port, so
+   * a url-only identity would serve the previous instance's workspace and
+   * session ids to the replacement (the sidebar loads a dead dsh_session and
+   * the workspace silently fails to bind).
+   *
    * @param {object|null} server - Current server handle.
    * @returns {string|null} Server identity, or null when unknown.
    */
   function serverIdentity(server) {
     const url = server && typeof server.url === "string" ? server.url : null;
     if (!url) return null;
-    const pid = server.owned === true && Number.isInteger(server.pid)
-      ? `#${server.pid}`
-      : "";
+    const pid = Number.isInteger(server.pid) ? `#${server.pid}` : "";
     return `${url}${pid}`;
   }
 
@@ -303,6 +316,12 @@ function createWorkspaceBinding({
     }
 
     const owned = Boolean(server && server.owned === true);
+    // A server this extension started - this window (owned) or a sibling
+    // window of the same environment (managed, adopted in shared mode) - is
+    // the extension's own instance, never a service the user must consent to
+    // having workspaces registered on. `owned` still drives the reported
+    // state: it keeps meaning "this window owns the child process".
+    const trustedServer = owned || Boolean(server && server.managed === true);
     ensureCacheServer(server);
     const key = cacheKey(cwd);
     if (!forceRefresh && cache.has(key)) {
@@ -344,10 +363,10 @@ function createWorkspaceBinding({
       const created = await createWorkspace(baseUrl, cwd, { fetchImpl });
       const workspace = created.workspace;
 
-      if (!owned && created.created === true) {
-        // A shared server just got a workspace registered that the user did
-        // not see coming - the consent gate fires now, before any session is
-        // bound to it.
+      if (!trustedServer && created.created === true) {
+        // A user-managed server just got a workspace registered that the user
+        // did not see coming - the consent gate fires now, before any session
+        // is bound to it.
         setState({
           state: BINDING_STATES.CONSENT,
           cwd,

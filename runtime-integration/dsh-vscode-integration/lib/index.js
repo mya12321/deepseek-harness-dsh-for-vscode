@@ -16,7 +16,19 @@ const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.me
 // process exits before the sidebar ever connects). This package is only
 // installed into extension-owned homes, where the web profile always
 // provides the webServer service.
-const inject = ['apiProxy', 'tools', 'llm', 'webServer'];
+//
+// 'apiProxy' must NOT be declared: it is an old-protocol service the typert
+// gateway (dsh ≥ 0.1.3-alpha.2) no longer provides, and a declared inject
+// that never exists keeps this entry "pending" forever — the boot's
+// assertEntriesActivated then FAILS THE WHOLE PROCESS ("1 entry did not
+// activate"), the extension's spawn-time self-heal restarts without the
+// embed overlay, and the instance runs without this plugin entirely (live
+// bug 2026-09-18: the shared instance booted plugin-less, nothing consumed
+// dsh_session, and every newly opened window's workspace never followed in
+// the sidebar). The apiProxy host bridge below is applied only when the
+// service happens to exist (older runtimes); everything this package needs
+// on typert runtimes (tools, llm, webServer) is declared explicitly.
+const inject = ['tools', 'llm', 'webServer'];
 const name = 'dsh-vscode-integration';
 
 // ---------------------------------------------------------------------------
@@ -343,21 +355,38 @@ function createWatchdogMonitor({
 
 function apply(ctx) {
   ctx.effect(() => {
-    const host = ctx.apiProxy.host;
-    const original = host.openPath;
-    host.openPath = async (request, signal) => {
-      const target = request && request.payload && request.payload.path;
-      if (typeof target !== 'string' || target.length === 0) {
-        return failure(request, 'path open failed: a path is required');
+    // openPath bridge: only meaningful on old-protocol runtimes that still
+    // provide the apiProxy host (typert runtimes dropped apiProxy entirely —
+    // property access below throws, which the guard turns into a no-op). The
+    // C1 watchdog MUST run on every runtime, so it shares this effect rather
+    // than depending on the bridge's availability.
+    let restoreOpenPath = null;
+    try {
+      const apiProxy = ctx.apiProxy;
+      const host = apiProxy && apiProxy.host;
+      if (host && typeof host.openPath === 'function') {
+        const original = host.openPath;
+        host.openPath = async (request, signal) => {
+          const target = request && request.payload && request.payload.path;
+          if (typeof target !== 'string' || target.length === 0) {
+            return failure(request, 'path open failed: a path is required');
+          }
+          try {
+            await openThroughBridge(target, signal);
+            return { rpcId: request.rpcId, result: { ok: true, value: { opened: true } } };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return failure(request, `path open failed: ${message}`);
+          }
+        };
+        restoreOpenPath = () => {
+          host.openPath = original;
+        };
       }
-      try {
-        await openThroughBridge(target, signal);
-        return { rpcId: request.rpcId, result: { ok: true, value: { opened: true } } };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return failure(request, `path open failed: ${message}`);
-      }
-    };
+    } catch {
+      // apiProxy does not exist on this runtime (typert gateway): skip the
+      // legacy bridge; access must never abort the effect.
+    }
     // C1 watchdog: if this DSH process is a VS Code-managed child, keep an eye
     // on its owner window and self-terminate only when the dual condition is
     // met (heartbeat expired AND owner gone). Inert for standalone DSH (no
@@ -367,7 +396,7 @@ function apply(ctx) {
     });
     monitor.start();
     return () => {
-      host.openPath = original;
+      if (restoreOpenPath) restoreOpenPath();
       monitor.stop();
     };
   }, 'dsh-vscode-integration: host.openPath bridge + C1 watchdog');

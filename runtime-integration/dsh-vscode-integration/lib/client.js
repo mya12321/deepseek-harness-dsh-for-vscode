@@ -362,37 +362,104 @@ window.__ModuleLoader__.load({
       };
     }
 
+    // Follow timing. The budget is deliberately generous and the loop waits
+    // for the sessions service itself: this bridge is the only thing that
+    // makes the sidebar show the switched-to workspace, and giving up is
+    // INVISIBLE — the page simply keeps rendering the previous workspace's
+    // conversation. The old 50 x 100ms window silently expired whenever the
+    // list mirror took longer than five seconds (large instances, a cold
+    // workspace fetch) or whenever `ctx.sessions` was not mounted at apply
+    // time (the follow was then never started at all). Live bug 2026-09-18:
+    // "switching folders does not move the sidebar".
+    const followLimits = {
+      tickMs: 100,
+      slowTickMs: 500,
+      fastWindowMs: 5000,
+      budgetMs: 60000,
+      // Re-opening is throttled and capped: a list refresh can reset the
+      // selection back to the persisted session, and re-issuing open() forever
+      // would fight the app. Ten tries spans the first list loads; past that
+      // the next iframe reload (the shell re-sends dsh_session) picks it up.
+      openIntervalMs: 500,
+      maxOpens: 10,
+    };
+
     function startEmbeddedSessionFollow(ctx) {
       const target = new URLSearchParams(window.location.search).get('dsh_session');
       if (!target) return () => {};
-      if (!ctx.sessions || typeof ctx.sessions.open !== 'function') return () => {};
-      if (!ctx.sessions.list || typeof ctx.sessions.list.getSnapshot !== 'function') return () => {};
+      const startedAt = Date.now();
+      const deadline = startedAt + followLimits.budgetMs;
       let disposed = false;
       let timer = null;
-      const attempt = (remaining) => {
-        if (disposed) return;
-        let snapshot = null;
+      let opens = 0;
+      let lastOpenAt = 0;
+      let baseline = null;
+      let baselineSeen = false;
+
+      const snapshotNow = () => {
+        if (!ctx.sessions || !ctx.sessions.list || typeof ctx.sessions.list.getSnapshot !== 'function') {
+          return null; // sessions service not mounted yet: keep waiting for it
+        }
         try {
-          snapshot = ctx.sessions.list.getSnapshot();
+          return ctx.sessions.list.getSnapshot();
         } catch {
-          // A broken snapshot store must never break activation.
-          return;
-        }
-        if (snapshot && snapshot.byId && snapshot.byId[target] !== undefined) {
-          if (snapshot.current !== target) {
-            try {
-              ctx.sessions.open(target);
-            } catch {
-              // select() can race list refreshes; the next reload retries.
-            }
-          }
-          return;
-        }
-        if (remaining > 0) {
-          timer = setTimeout(() => attempt(remaining - 1), 100);
+          return null; // a broken snapshot store must never break activation
         }
       };
-      attempt(50);
+
+      const tick = () => {
+        if (disposed) return;
+        const snapshot = snapshotNow();
+        let done = false;
+        if (snapshot) {
+          const current = typeof snapshot.current === 'string' ? snapshot.current : null;
+          // A 'loading' snapshot still carries the PREVIOUS list, so neither
+          // the baseline nor a stand-down decision may be read from it.
+          const loaded = snapshot.phase === undefined || snapshot.phase !== 'loading';
+          // The baseline is the app's restore point: the session it selected
+          // on its own before this bridge ran. A null current is not a
+          // selection (the list has not restored one yet), so the baseline
+          // stays open until a real one appears — freezing null would make the
+          // restore itself look like a user click. The user cannot beat it
+          // either: clicking a row requires the list, which is loaded by then.
+          if (loaded && !baselineSeen && current !== null) {
+            baseline = current;
+            baselineSeen = true;
+          }
+          if (current === target) {
+            done = true; // followed — or the user picked it themselves
+          } else if (ctx.sessions && typeof ctx.sessions.open === 'function'
+            && snapshot.byId && snapshot.byId[target] !== undefined) {
+            // Someone other than the restore-point chose a session: that is
+            // the user clicking a row (or the app moving on), and the follow
+            // must stand down instead of yanking the view back. 'Not yet in
+            // the list' is NOT that case — it is the list still loading.
+            if (loaded && baselineSeen && current !== baseline) {
+              done = true;
+            } else if (opens < followLimits.maxOpens
+              && Date.now() - lastOpenAt >= followLimits.openIntervalMs) {
+              opens += 1;
+              lastOpenAt = Date.now();
+              try {
+                ctx.sessions.open(target); // select() can race a list refresh
+              } catch {
+                // the next tick retries
+              }
+            }
+          }
+        }
+        if (done) return;
+        if (Date.now() < deadline) {
+          const interval = Date.now() - startedAt < followLimits.fastWindowMs
+            ? followLimits.tickMs
+            : followLimits.slowTickMs;
+          timer = setTimeout(tick, interval);
+          // Node (tests): keep the poll off the event-loop keep-alive set so
+          // the host process can exit; browsers return a numeric handle.
+          if (timer && typeof timer.unref === 'function') timer.unref();
+        }
+      };
+      tick();
       return () => {
         disposed = true;
         if (timer) {
@@ -671,6 +738,10 @@ window.__ModuleLoader__.load({
       parseWorkspacePathTarget,
       splitLineSuffix,
     };
+    // Follow-loop timings, exposed so unit tests can shrink the budget instead
+    // of sleeping for it. Read on every tick, so a test may retune them after
+    // load. Not consumed by the DSH module loader.
+    module.exports.__sessionFollowLimits = followLimits;
     return module.exports;
   },
 });

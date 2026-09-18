@@ -1,7 +1,7 @@
 # Known Issues / 问题记录
 
-> 更新日期：2026-09-17 · 对应版本：**1.2.0（开发中）** · 当前**1 个未修复已知问题（独立跟进项）**
-> Updated 2026-09-17 · tracks in-development **1.2.0** · **1 open issue (separate follow-up)**
+> 更新日期：2026-09-18 · 对应版本：**1.2.0（开发中）** · 当前**1 个未修复已知问题（独立跟进项）**
+> Updated 2026-09-18 · tracks in-development **1.2.0** · **1 open issue (separate follow-up)**
 
 迁移说明：1.2.0 已把扩展迁移到 dsh ≥ 0.1.3-alpha.2 的 typert 线上协议（实测 0.1.5）——斜杠式 JSON-RPC + `/api/remote.mux` WebSocket，旧式 `session.list` / `workspace.list` / `events.mux` / `session.export` 端点全部移除、无降级（见 [CHANGELOG.md](CHANGELOG.md)）。`session/prompt` 请求 id 改为客户端生成；会话回填改走 follow 快照的 `records`。
 Migration note: 1.2.0 hardcodes the typert wire protocol (dsh ≥ 0.1.3-alpha.2, tested on 0.1.5) — slashed JSON-RPC plus `/api/remote.mux` WebSocket; the legacy `session.list` / `workspace.list` / `events.mux` / `session.export` endpoints are gone with no fallback. `session/prompt` request ids are client-minted and the changes-view backfill reads the follow snapshot's `records`.
@@ -36,12 +36,25 @@ Past issues and their fixes (details in the changelog and dev notes):
 - 主题验收：切换 VS Code 亮/暗主题，DSH 侧栏应实时跟随；卸载/禁用扩展后 DSH 恢复其自身主题偏好。
   Verify theme-follow by toggling the VS Code light/dark theme; on dispose the DSH preference is restored.
 
+## 验收提示 / Verification notes（跨窗口共享，2026-09-18 修复）
+
+- 「同环境共享一个 dsh 实例」此前在围栏运行时上是**静默失效**的：配置端口的收养以 `isDsh` 为门槛（围栏下无 token 探测恒为 `isDsh:false`），进程发现用的 `dsh.+web` 又匹配不到扩展自己的受管启动形态，于是每个窗口各起一个实例；收养来的句柄 `owned:false`，绑定工作区时还会弹同意框、拒绝即回滚。现已全部修复。
+  Cross-window sharing was silently broken on fenced runtimes: port adoption was gated on `isDsh` (never true for a tokenless probe under the fence), process discovery's `dsh.+web` never matched the extension's own managed launch shape, so every window spawned its own instance; and an adopted handle was `owned:false`, so binding a workspace prompted for consent and a decline rolled it back.
+- 验证：同一环境（Windows 或 WSL）开两个窗口指向同一 DSH home → `dsh-instances.json` 只应有一条该端口的条目（`ps` 里只有一个 `dsh/lib/bin.js --port …`），第二个窗口的状态栏显示 `reused`；在第二个窗口切换文件夹 → 不再弹同意框，侧栏跟随到该文件夹的会话；关闭第一个窗口后实例仍在（第二窗口附着），关闭全部窗口后实例退出。
+  Verify by opening two windows against the same DSH home in one environment: the registry should hold a single entry for that port (one `dsh/lib/bin.js --port …` in `ps`) with the second window reporting `reused`; switching folders in the second window must bind without a consent prompt and move the sidebar; the instance must survive the first window closing (the second is attached) and exit once every window is gone.
+- 注册表条目现在记录实例启动 token，文件权限为 `0600`（该 token 随围栏实例的收养流程使用，等同该文件里本就记录的 spawn 日志路径）。
+  Registry entries now record the instance launch token and the file is mode `0600` (used by the adoption path for fenced instances; same secret the recorded spawn-log path already carried).
+- 2026-09-18 补充修复（新开窗口的工作区「绑不上」的另一半根因）：实例本体的启动随 embed overlay 全灭——`dsh-vscode-integration` 服务端入口声明了 `inject: ['apiProxy', …]`，而 `apiProxy` 在 typert 网关上已不存在 → 启动断言 "1 entry did not activate" 整个进程 exit 1 → 扩展自愈去掉 `--patch` 重试，实例**无插件运行**。此时 API 层的注册表/会话绑定都正常（诊断看不出异常），但 `dsh_session` 没有任何消费方，新开窗口侧栏里的 Web 应用只会自动打开「最近更新的工作区」（通常是另一个窗口的），表现为「新开的插件 workspace 没有正确绑定」。inject 已移除 `apiProxy`（旧协议 openPath 桥改为服务存在才挂接）；**升级后请重启 DSH 实例**，并可在 DSH 输出通道确认不再出现 `[selfheal] DSH exited early with --patch`。
+  Follow-up fix 2026-09-18 (the other half of "a newly opened window's workspace never binds"): the instance boot itself died with the embed overlay — the plugin's server entry declared `inject: ['apiProxy', …]`, a service the typert gateway no longer has, so the boot asserted "1 entry did not activate" and exited; the extension's self-heal then retried without `--patch`, leaving the instance running WITHOUT the plugin. API-level binding stayed healthy (invisible in diagnostics), but nothing consumed `dsh_session`, so each newly opened window's sidebar auto-opened the most recently updated workspace — usually the other window's — reading as "the new workspace never binds". The inject drops `apiProxy` (the legacy openPath bridge now attaches only when the service exists); restart the DSH instance after upgrading and confirm the DSH output channel no longer shows `[selfheal] DSH exited early with --patch`.
+
 ## 验收提示 / Verification notes（issue 6）
 
 - 修复同样位于 DSH 侧 `dsh-vscode-integration/client.js`，扩展每次激活时同步进所选 DSH home；**升级扩展后必须完全退出并重启 VS Code**（⌘Q），并重启 DSH 实例使新 client.js 生效。
   The fix likewise ships in the DSH-side `dsh-vscode-integration/client.js` re-synced on every activation; fully quit and restart VS Code after upgrading, and restart the DSH instance.
 - 验收：打开文件夹 A → 侧栏绑定 A 的会话；`File → Open Folder` 切到文件夹 B（或多根工作区里把活动编辑器移到另一根）→ 侧栏应重载并自动切到 B 的空白会话，会话工具的工作区根随之为 B；自管 DSH 子进程 PID 全程不变。
   Verify by opening folder A, then `File → Open Folder` to folder B (or focusing an editor from another multi-root folder): the sidebar reloads onto B's blank session, tool sandboxes root at B, and the owned child PID never changes.
+- 2026-09-18 残留修复：上述跟随链路里，DSH 侧的 `dsh_session` 消费方等待上限只有 5 秒，且会话服务在 apply 时未挂载就**静默不启动**——两侧都无提示，表现为侧栏停在旧工作区的会话。现在等待会话服务挂载、预算 60 秒、以 `current` 真正切到目标为完成条件，并在列表刷新重置选中项时重试；用户自己点了别的会话则立即退让。切文件夹时若仍不跟随，请确认 DSH 实例已重启（新 client.js 生效）。
+  Residual fix 2026-09-18: the DSH-side `dsh_session` consumer waited at most 5s and silently never started when the sessions service was not mounted at apply time — both invisible, leaving the sidebar on the old workspace's session. It now waits for the service to mount, runs a 60s budget, completes when `current` actually moves to the target, retries across list refreshes, and stands down when the user picks another session. If a folder switch still does not follow, confirm the DSH instance was restarted so the new client.js is live.
 
 ## 内部开发文档 / Internal dev notes
 
