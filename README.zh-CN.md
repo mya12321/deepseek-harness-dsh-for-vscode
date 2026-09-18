@@ -17,10 +17,10 @@
 | 项 | 要求 |
 |---|---|
 | VS Code | ≥ 1.106，仅桌面版；不支持远程 / 虚拟 / 不受信任工作区 |
-| DSH CLI | `npm i -g @deepseek-ai/dsh`，要求 ≥ 0.1.3-alpha.2（typert 线上协议；已在 0.1.5 验证） |
+| DSH CLI | `npm i -g @deepseek-ai/dsh`，要求 ≥ 0.1.5-rc.2（typert 线上协议） |
 | Node.js | 自动发现；非标准位置设 `dsh.local.nodePath` |
 
-> **线上协议：** dsh 自 0.1.3-alpha.2 起使用 typert 网关——斜杠式 JSON-RPC 端点（`POST /api/session/list`、`/api/session/prompt`……）与 `/api/remote.mux` WebSocket 事件流。本扩展硬编码该协议，不再使用旧式 `session.list` / `session.export` / `events.mux` / `workspace.list` 端点（无降级），因此低于 0.1.3-alpha.2 的 dsh 无法与本扩展配合。
+> **线上协议：** 运行时使用 typert 网关——斜杠式 JSON-RPC 端点（`POST /api/session/list`、`/api/session/prompt`……）与 `/api/remote.mux` WebSocket 事件流。本扩展硬编码该协议并要求 dsh ≥ 0.1.5-rc.2（无降级）；不再使用旧式 `session.list` / `session.export` / `events.mux` / `workspace.list` 端点，低于 0.1.5-rc.2 的 dsh 无法与本扩展配合。
 
 ## 📦 安装
 

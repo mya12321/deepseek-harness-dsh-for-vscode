@@ -2,7 +2,7 @@
 
 /**
  * wsStreamClient.js — minimal zero-dependency RFC 6455 WebSocket client and
- * typert Remote-stream transport for the DSH gateway (dsh >= 0.1.5).
+ * typert Remote-stream transport for the DSH gateway (dsh >= 0.1.5-rc.2).
  *
  * The extension host Node versions (18/20) expose `globalThis.fetch` but no
  * `WebSocket` global, and the extension deliberately ships without runtime

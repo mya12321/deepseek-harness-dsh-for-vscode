@@ -17,10 +17,10 @@ Embeds the full DSH web UI in the VS Code auxiliary sidebar: every window automa
 | Item | Requirement |
 |---|---|
 | VS Code | ≥ 1.106, desktop only; remote / virtual / untrusted workspaces not supported |
-| DSH CLI | `npm i -g @deepseek-ai/dsh`, requires ≥ 0.1.3-alpha.2 (typert wire protocol; tested on 0.1.5) |
+| DSH CLI | `npm i -g @deepseek-ai/dsh`, requires ≥ 0.1.5-rc.2 (typert wire protocol) |
 | Node.js | auto-detected; set `dsh.local.nodePath` for non-standard locations |
 
-> **Wire protocol:** since dsh 0.1.3-alpha.2 the runtime speaks the typert gateway — slashed JSON-RPC endpoints (`POST /api/session/list`, `/api/session/prompt`, …) and WebSocket event streams on `/api/remote.mux`. This extension hardcodes that protocol and no longer uses the legacy `session.list` / `session.export` / `events.mux` / `workspace.list` endpoints (no fallback), so dsh builds below 0.1.3-alpha.2 cannot work with it.
+> **Wire protocol:** the runtime speaks the typert gateway — slashed JSON-RPC endpoints (`POST /api/session/list`, `/api/session/prompt`, …) and WebSocket event streams on `/api/remote.mux`. This extension hardcodes that protocol and requires dsh ≥ 0.1.5-rc.2 (no fallback); it no longer uses the legacy `session.list` / `session.export` / `events.mux` / `workspace.list` endpoints, and dsh builds below 0.1.5-rc.2 cannot work with it.
 
 ## 📦 Install
 

@@ -3,7 +3,7 @@
 /**
  * DSH chat client for the VS Code sidebar.
  *
- * Thin client over two owned-DSH endpoints (dsh >= 0.1.5, typert gateway):
+ * Thin client over two owned-DSH endpoints (dsh >= 0.1.5-rc.2, typert gateway):
  *   - POST /api/session/prompt  — enqueue a prompt into a session
  *   - WS   /api/remote.mux      — typert Remote stream carrying session/follow
  *

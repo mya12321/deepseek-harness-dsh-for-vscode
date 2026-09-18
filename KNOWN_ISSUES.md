@@ -3,8 +3,8 @@
 > 更新日期：2026-09-18 · 对应版本：**1.2.0（开发中）** · 当前**1 个未修复已知问题（独立跟进项）**
 > Updated 2026-09-18 · tracks in-development **1.2.0** · **1 open issue (separate follow-up)**
 
-迁移说明：1.2.0 已把扩展迁移到 dsh ≥ 0.1.3-alpha.2 的 typert 线上协议（实测 0.1.5）——斜杠式 JSON-RPC + `/api/remote.mux` WebSocket，旧式 `session.list` / `workspace.list` / `events.mux` / `session.export` 端点全部移除、无降级（见 [CHANGELOG.md](CHANGELOG.md)）。`session/prompt` 请求 id 改为客户端生成；会话回填改走 follow 快照的 `records`。
-Migration note: 1.2.0 hardcodes the typert wire protocol (dsh ≥ 0.1.3-alpha.2, tested on 0.1.5) — slashed JSON-RPC plus `/api/remote.mux` WebSocket; the legacy `session.list` / `workspace.list` / `events.mux` / `session.export` endpoints are gone with no fallback. `session/prompt` request ids are client-minted and the changes-view backfill reads the follow snapshot's `records`.
+迁移说明：1.2.0 已把扩展迁移到 typert 线上协议，并要求 dsh ≥ 0.1.5-rc.2——斜杠式 JSON-RPC + `/api/remote.mux` WebSocket，旧式 `session.list` / `workspace.list` / `events.mux` / `session.export` 端点全部移除、无降级（见 [CHANGELOG.md](CHANGELOG.md)）。`session/prompt` 请求 id 改为客户端生成；会话回填改走 follow 快照的 `records`。
+Migration note: 1.2.0 hardcodes the typert wire protocol and requires dsh ≥ 0.1.5-rc.2 — slashed JSON-RPC plus `/api/remote.mux` WebSocket; the legacy `session.list` / `workspace.list` / `events.mux` / `session.export` endpoints are gone with no fallback. `session/prompt` request ids are client-minted and the changes-view backfill reads the follow snapshot's `records`.
 
 ## 未修复已知问题 / Open issue
 
