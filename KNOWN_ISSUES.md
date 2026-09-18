@@ -1,16 +1,15 @@
 # Known Issues / 问题记录
 
-> 更新日期：2026-09-18 · 对应版本：**1.2.0（开发中）** · 当前**1 个未修复已知问题（独立跟进项）**
-> Updated 2026-09-18 · tracks in-development **1.2.0** · **1 open issue (separate follow-up)**
+> 更新日期：2026-09-19 · 对应版本：**1.2.0（开发中）** · 当前**0 个未修复已知问题**
+> Updated 2026-09-19 · tracks in-development **1.2.0** · **0 open issues**
 
 迁移说明：1.2.0 已把扩展迁移到 typert 线上协议，并要求 dsh ≥ 0.1.5-rc.2——斜杠式 JSON-RPC + `/api/remote.mux` WebSocket，旧式 `session.list` / `workspace.list` / `events.mux` / `session.export` 端点全部移除、无降级（见 [CHANGELOG.md](CHANGELOG.md)）。`session/prompt` 请求 id 改为客户端生成；会话回填改走 follow 快照的 `records`。
 Migration note: 1.2.0 hardcodes the typert wire protocol and requires dsh ≥ 0.1.5-rc.2 — slashed JSON-RPC plus `/api/remote.mux` WebSocket; the legacy `session.list` / `workspace.list` / `events.mux` / `session.export` endpoints are gone with no fallback. `session/prompt` request ids are client-minted and the changes-view backfill reads the follow snapshot's `records`.
 
 ## 未修复已知问题 / Open issue
 
-| # | 问题 / Issue | 状态 / Status |
-|---|---|---|
-| 1 | `runtime-integration/dsh-vscode-integration` 插件的桥接端点（`/api/lm/*`、`/api/fim`、`/api/vscode/open-link`）在 dsh 0.1.5 上返回 404（这些端点仍是旧协议遗留，未随 typert 迁移）→ LM 路由 / Tab 补全 / 打开链接等插件侧能力不可用。**独立跟进项**，不属于本次 404 迁移范围。 / The plugin's bridge endpoints (`/api/lm/*`, `/api/fim`, `/api/vscode/open-link`) still 404 on dsh 0.1.5 — they predate the typert migration on the plugin side, so LM routing / tab completion / open-link are unavailable. Separate follow-up, out of scope for this 404 migration. | 跟进中 / in progress |
+（无 / none — 2026-09-18 登记的插件桥接端点 404 问题已于 2026-09-19 修复，见下方验收提示与 [CHANGELOG.md](CHANGELOG.md)。）
+(none — the plugin bridge-endpoint 404 issue registered on 2026-09-18 was fixed on 2026-09-19; see the verification notes below and the changelog.)
 
 历史问题与修复索引（复现细节见 [CHANGELOG.md](CHANGELOG.md) 与 [docs/dev/](docs/dev/)）：
 Past issues and their fixes (details in the changelog and dev notes):
@@ -26,6 +25,18 @@ Past issues and their fixes (details in the changelog and dev notes):
 | 7 | @dsh 参与者每条消息新建会话且标题为裸 UUID（会话爆炸）/ the @dsh participant created a new session per message with bare-UUID titles | 1.1.2 |
 | 8 | 桥推送的编辑立即落盘、Accept 仅记账、Undo 反向区间被 applyEdit 拒绝 / bridge-pushed edits wrote to disk immediately, Accept only bookkept, and Undo reverse ranges were rejected | 1.1.2 |
 | 9 | 终端 `read` 始终为空：无 onDidWriteTerminalData 输出回读 / bridge `terminal/read` always returned empty — no terminal output read-back | 1.1.2 |
+| 10 | 插件桥接端点（`/api/lm/*`、`/api/fim`、`/api/vscode/open-link`）在 dsh 0.1.5 上返回 404，LM 路由 / Tab 补全 / 打开链接不可用（根因：路由按**启动时** env 条件挂载，功能后开或收养共享实例时永远挂不上，请求落进 `/api` fetch 桥得到裸 404） / plugin bridge endpoints returned 404 on dsh 0.1.5 — routes were mounted only when their feature env existed at SPAWN time, so later toggles and adopted shared instances never mounted them | 1.2.0 |
+
+## 验收提示 / Verification notes（插件桥接端点 404，2026-09-19 修复）
+
+- 根因并非「未随 typert 迁移」：这些端点本就是挂在工作面（webServer）上的裸 HTTP 路由，挂上即用。真正的缺陷是**挂载条件**——路由只在 DSH 进程的 spawn env 里有对应功能键（`DSH_LM_BRIDGE_TOKEN` / `DSH_FIM_BRIDGE_TOKEN` / `DSH_VSCODE_OPEN_URL/TOKEN`）时才挂载，而 env 是**启动时快照**：后开功能、收养的共享实例、旧版本扩展启动的实例，路由永远不存在 → 请求落进 `/api` 前缀路由的 fetch 桥，已认证请求得到裸 `404 not found`，未认证得到围栏 401。实测复现于 dsh 0.1.5-rc.2（2026-09-19）。
+  The root cause was not "not migrated to typert": these are plain webServer HTTP routes that work once mounted. The defect was the MOUNT CONDITION — routes existed only when the DSH process env (a spawn-time snapshot) carried the feature keys, so a later toggle, an adopted shared instance, or an instance spawned by an older build never mounted them, and requests fell into the `/api` prefix fetch bridge answering a bare `404 not found` (authenticated) or a fence 401. Reproduced live on dsh 0.1.5-rc.2 (2026-09-19).
+- 修复（插件 0.8.0 + 扩展）：`/api/lm/*`、`/api/fim`、`/api/vscode/open-link` 现在**始终挂载**，按请求降级——未配置时返回 `503 fim-not-configured` / `503 editor-links-unavailable`（带操作指引），不再有 404。新增 `POST /api/vscode/configure`（Bearer `DSH_VSCODE_CONFIGURE_TOKEN`）：扩展把 FIM/LM/editor-links 的**运行时**配置推给运行中的实例（token 集合为 upsert 合并，共享实例上多窗口各自注入自己的 per-window token）；该 configure token 同时记入实例注册表（`configureToken` 字段，与 `authToken` 同一 0600 文件），收养窗口因此也能配置它没有亲手启动的实例。
+  Fix (plugin 0.8.0 + extension): the three route groups are ALWAYS mounted and degrade per request — an unconfigured instance answers `503 fim-not-configured` / `503 editor-links-unavailable` with actionable guidance instead of a 404. New `POST /api/vscode/configure` (Bearer `DSH_VSCODE_CONFIGURE_TOKEN`) lets the extension push FIM/LM/editor-links config to a RUNNING instance (token sets merge by upsert so each window of a shared instance adds its own per-window bearer); the configure token is recorded in the instance registry (`configureToken`, same 0600 file as `authToken`), so an adopting window can configure an instance it did not spawn.
+- 实测验收（dsh 0.1.5-rc.2，2026-09-19）：未配置实例上 `POST /api/fim` 503（原来 404）→ configure 推送（FIM token + 上游 + LM token + editor-links 桥）→ `POST /api/fim` 200 且 SSE 流出 mock 上游增量、`GET /api/lm/models`（推送的 token）200 返回真实模型列表、open-link 路由由 503 变为实际调用推送的桥端点。
+  Live verification (dsh 0.1.5-rc.2, 2026-09-19): an unconfigured instance answered 503 (was 404); after one configure push, `POST /api/fim` streamed SSE deltas from the mock upstream, `GET /api/lm/models` with the pushed token returned the real model list, and the open-link route went from 503 to actively calling the pushed bridge endpoint.
+- **升级后请执行一次 DSH: Restart Server**：旧实例的插件（< 0.8.0）没有 configure 路由，扩展推送会得到 404 并在诊断里提示重启；重启后同步 0.8.0 插件即全部生效。手动 `dsh web` 启动（无 overlay）的实例依旧无插件，属既有边界。
+  Run DSH: Restart Server once after upgrading — an instance running the old plugin (< 0.8.0) has no configure route; the extension logs the 404 hint in diagnostics and a restart syncs the 0.8.0 plugin. A manually started `dsh web` (no overlay) still has no plugin, as before.
 
 ## 验收提示 / Verification notes（issue 3/4）
 

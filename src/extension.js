@@ -120,6 +120,16 @@ let vscode = null; // injected during activation; avoids loading vscode in node:
 let hostContext = null; // workspace/config facade bound during activation
 let manager = null; // ServerManager instance (created in activate)
 let currentServer = null; // RunningServer | null
+// Live bridge feature config for the plugin's POST /api/vscode/configure
+// push (dsh-vscode-integration 0.8.0, known-issue #1 fix): spawn env is a
+// SPAWN-TIME snapshot, so a feature enabled later — or a window adopting an
+// instance another window spawned — could never reach the running plugin and
+// its bridge endpoints answered the /api fetch bridge's bare 404. Each
+// feature setup records its endpoint/token here; the values ride
+// pushBridgeConfigure() to the running instance (Bearer configureToken).
+let fimBridgeConfig = null; // { token, baseUrl, apiKey } | null (tab completion)
+let lmBridgeToken = null; // string | null (model routing)
+let editorLinksBridgeEnv = null; // { DSH_VSCODE_OPEN_URL, DSH_VSCODE_OPEN_TOKEN } | null
 // Shared auth-aware fetch for every DSH /api consumer (session create/list/
 // rename, chat prompt + SSE, workspace binding, LM route). On dsh 0.1.2+
 // the server's auth fence requires a Cookie minted from the launch token;
@@ -878,12 +888,97 @@ async function stopOwnedServer({ force = false } = {}) {
  * to paint and the view — resolved later — schedules another ensure to show it.
  */
 /**
+ * Build the current bridge-configure patch from the live feature state.
+ * Token arrays are UPSERT semantics on the plugin side (per-window bearer
+ * tokens accumulate on a shared instance until restart); scalar fields
+ * replace. An empty patch (no feature produced config) pushes nothing.
+ */
+function currentBridgeConfigurePatch() {
+  const patch = {};
+  if (fimBridgeConfig && typeof fimBridgeConfig.token === 'string' && fimBridgeConfig.token.length > 0) {
+    patch.fim = {
+      addTokens: [fimBridgeConfig.token],
+      baseUrl: typeof fimBridgeConfig.baseUrl === 'string' ? fimBridgeConfig.baseUrl : '',
+      apiKey: typeof fimBridgeConfig.apiKey === 'string' ? fimBridgeConfig.apiKey : '',
+    };
+  }
+  if (typeof lmBridgeToken === 'string' && lmBridgeToken.length > 0) {
+    patch.lm = { addTokens: [lmBridgeToken] };
+  }
+  if (editorLinksBridgeEnv
+    && typeof editorLinksBridgeEnv.DSH_VSCODE_OPEN_URL === 'string' && editorLinksBridgeEnv.DSH_VSCODE_OPEN_URL.length > 0
+    && typeof editorLinksBridgeEnv.DSH_VSCODE_OPEN_TOKEN === 'string' && editorLinksBridgeEnv.DSH_VSCODE_OPEN_TOKEN.length > 0) {
+    patch.editorLinks = {
+      openUrl: editorLinksBridgeEnv.DSH_VSCODE_OPEN_URL,
+      openToken: editorLinksBridgeEnv.DSH_VSCODE_OPEN_TOKEN,
+    };
+  }
+  return patch;
+}
+
+/**
+ * Push the current bridge feature config to a running DSH instance over
+ * POST /api/vscode/configure (dsh-vscode-integration 0.8.0). Best-effort by
+ * design: every failure is diagnostic-only, never lifecycle-breaking.
+ *   - 404  → the instance's plugin predates the configure route (spawned by
+ *     an older extension build): a restart (dsh.restartServer) brings it up.
+ *   - 401  → this window holds no configure token for the instance (user-
+ *     started `dsh web`, or a registry entry from an old build).
+ *   - else → network/server errors: the next ensure/adopt retry pushes again.
+ */
+async function pushBridgeConfigure(server) {
+  const target = server || currentServer;
+  if (!target || typeof target.url !== 'string' || target.url.length === 0) return;
+  const patch = currentBridgeConfigurePatch();
+  if (Object.keys(patch).length === 0) return;
+  const configureToken = (typeof target.configureToken === 'string' && target.configureToken.length > 0)
+    ? target.configureToken
+    : (manager && typeof manager.configureToken === 'function' ? manager.configureToken() : null);
+  if (!configureToken) {
+    appendDiagnostic('[bridgeConfigure] no configure token for ' + target.url + ' (instance not extension-managed); skip');
+    return;
+  }
+  try {
+    const response = await fetch(target.url + '/api/vscode/configure', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + configureToken,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(patch),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined,
+    });
+    if (response.ok) {
+      appendDiagnostic('[bridgeConfigure] applied to ' + target.url + ': ' + JSON.stringify(patch).slice(0, 200));
+      return;
+    }
+    if (response.status === 404) {
+      appendDiagnostic('[bridgeConfigure] ' + target.url + ' has no /api/vscode/configure (older plugin); run DSH: Restart Server to pick up live bridge config');
+      return;
+    }
+    if (response.status === 401) {
+      appendDiagnostic('[bridgeConfigure] ' + target.url + ' rejected the configure token; run DSH: Restart Server so this window can configure the instance');
+      return;
+    }
+    appendDiagnostic('[bridgeConfigure] ' + target.url + ' answered HTTP ' + response.status);
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    appendDiagnostic('[bridgeConfigure] push to ' + target.url + ' failed: ' + message);
+  }
+}
+
+/**
  * Bind the sidebar to one ready RunningServer handle: record it, optionally
  * auto-bind an owned instance to the current workspace session, externalize
  * its URL for the webview and update the status bar / iframe.
  */
 async function bindServer(context, server, cwd) {
   currentServer = server;
+  // Known-issue #1 fix: whatever handle just became current (freshly spawned,
+  // reused, or adopted from another window), sync THIS window's live bridge
+  // feature config into the running plugin. Fire-and-forget: a slow or
+  // failing push must never delay the sidebar bind.
+  void pushBridgeConfigure(server);
   boundCwd = cwd;
   // SM-3: fenced runtimes (dsh 0.1.2+) embed through the extension's
   // authenticating loopback proxy — a webview iframe cannot carry dsh's
@@ -2107,6 +2202,9 @@ async function setupEditorLinks({ context, services }) {
     Object.assign(services.bridgeEnv, textDocumentBridge.env);
   }
   services.manager?.setSpawnEnv?.(textDocumentBridge.env || {});
+  // Known-issue #1 fix: record for the configure push (running instance).
+  editorLinksBridgeEnv = textDocumentBridge.env || null;
+  void pushBridgeConfigure(null);
   const handler = async (message, webview) => {
     const request = parseInteractionRequest(message);
     if (!request || request.method === 'clipboard/writeText') return false;
@@ -2129,6 +2227,7 @@ async function setupEditorLinks({ context, services }) {
     interactionHandlers = interactionHandlers.filter((h) => h !== handler);
     await textDocumentBridge?.close().catch(() => {});
     textDocumentBridge = null;
+    editorLinksBridgeEnv = null;
   };
 }
 
@@ -2315,7 +2414,12 @@ async function setupTabCompletion({ context, services }) {
     return env;
   }
   const refreshFimSpawnEnv = async () => {
-    services.manager?.setSpawnEnv?.(await readFimSpawnEnv());
+    const env = await readFimSpawnEnv();
+    services.manager?.setSpawnEnv?.(env);
+    // Known-issue #1 fix: also record the config for the configure push so a
+    // RUNNING instance (adopted or started before the toggle) learns it.
+    fimBridgeConfig = { token, baseUrl: env.DSH_FIM_BASE_URL || '', apiKey: env.DSH_FIM_API_KEY || '' };
+    void pushBridgeConfigure(null);
   };
   await refreshFimSpawnEnv();
   if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
@@ -2357,6 +2461,9 @@ async function setupTabCompletion({ context, services }) {
     }
     provider.dispose();
     services.manager?.setSpawnEnv?.({ DSH_FIM_BRIDGE_TOKEN: '', DSH_FIM_BASE_URL: '', DSH_FIM_API_KEY: '' });
+    // Stop advertising this window's FIM config in future configure pushes
+    // (tokens already applied on a shared instance persist until restart).
+    fimBridgeConfig = null;
   };
 }
 
@@ -2405,11 +2512,15 @@ async function setupLmRoute({ context, services }) {
     fetchImpl: dshApiFetch,
   });
   services.manager?.setSpawnEnv?.({ DSH_LM_BRIDGE_TOKEN: token });
+  // Known-issue #1 fix: record for the configure push (running instance).
+  lmBridgeToken = token;
+  void pushBridgeConfigure(null);
   context.subscriptions.push(lmRoute.disposable);
   return () => {
     lmRoute?.disposable?.dispose?.();
     lmRoute = null;
     services.manager?.setSpawnEnv?.({ DSH_LM_BRIDGE_TOKEN: '' });
+    lmBridgeToken = null;
   };
 }
 

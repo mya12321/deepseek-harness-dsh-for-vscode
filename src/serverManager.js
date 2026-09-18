@@ -29,6 +29,7 @@
 
 const net = require('node:net');
 const { spawn, execFileSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const {
@@ -369,6 +370,12 @@ class ServerManager {
     this._healthPort = null;        // port the health poll probes
     this._extraArgs = [];           // dsh.extraArgs appended to owned spawns
     this._registryFile = null; // registry merged on ready (own entry removed on stop)
+    // Configure token for the DSH-side /api/vscode/configure route (plugin
+    // 0.8.0): the extension pushes live FIM/LM/editor-links bridge config to
+    // a RUNNING instance over it. Generated once per manager, injected into
+    // every spawn env, recorded in the registry entry (next to authToken) so
+    // an adopting window can configure an instance it did not spawn.
+    this._configureToken = null;
     this._stopping = false; // true while a deliberate stop() is in progress
     this._ownedServer = null; // last ready endpoint backed by this._child
     this._cancelGeneration = 0; // invalidates an in-flight ensure/spawn operation
@@ -465,6 +472,17 @@ class ServerManager {
     return { ...this.spawnEnv };
   }
 
+  /**
+   * This window's configure token for the plugin's /api/vscode/configure
+   * route (generated once, stable for the manager's lifetime).
+   */
+  configureToken() {
+    if (typeof this._configureToken !== 'string' || this._configureToken.length === 0) {
+      this._configureToken = crypto.randomBytes(32).toString('hex');
+    }
+    return this._configureToken;
+  }
+
   /** True while this manager still owns a spawned child, including startup. */
   hasOwnedChild() {
     return Boolean(this._child);
@@ -487,6 +505,8 @@ class ServerManager {
       ...this.spawnEnv,
       ...(this.resolvedRuntime ? { DSH_HOME: this.resolvedRuntime.dshHome } : {}),
       DSH_TEXT_EDITOR: 'vscode',
+      // Plugin 0.8.0 /api/vscode/configure bearer (see configureToken()).
+      DSH_VSCODE_CONFIGURE_TOKEN: this.configureToken(),
     };
   }
 
@@ -535,6 +555,14 @@ class ServerManager {
         : null)
       : (typeof adoptedToken === 'string' && adoptedToken.length > 0 ? adoptedToken : null);
     const adoptedPid = adoption && Number.isInteger(adoption.pid) ? adoption.pid : null;
+    // Configure token: for our own child, ours; for an adopted instance, the
+    // spawning window recorded it in the registry entry (plugin 0.8.0) so
+    // this window can push live bridge config to the shared instance.
+    const configureToken = owned
+      ? (typeof this._configureToken === 'string' && this._configureToken.length > 0 ? this._configureToken : null)
+      : (adoption && typeof adoption.configureToken === 'string' && adoption.configureToken.length > 0
+        ? adoption.configureToken
+        : null);
     return {
       url: `http://${host}:${port}`,
       host,
@@ -546,6 +574,7 @@ class ServerManager {
         authToken,
         authUrl: `http://${host}:${port}/?token=${encodeURIComponent(authToken)}`,
       } : {}),
+      ...(configureToken ? { configureToken } : {}),
     };
   }
 
@@ -604,7 +633,13 @@ class ServerManager {
         this._startHealthWatch(host, port, token);
         const managedEntry = ServerManager._managedEntryFromRegistry(registryFile, host, port);
         const handle = this._reuseHandle(host, port, token, managedEntry
-          ? { pid: managedEntry.pid, managed: true }
+          ? {
+            pid: managedEntry.pid,
+            managed: true,
+            // Plugin 0.8.0: the spawning window's configure bearer, so this
+            // adopting window can push live bridge config to the instance.
+            configureToken: typeof managedEntry.configureToken === 'string' ? managedEntry.configureToken : null,
+          }
           : null);
         if (!handle.owned) {
           ServerManager._registerAdopter(registryFile, {
@@ -1660,6 +1695,10 @@ class ServerManager {
         // records the log path, whose ready line carries the token verbatim —
         // so nothing new is exposed; _writeRegistry keeps the file at 0600.
         ...(authToken ? { authToken } : {}),
+        // Plugin 0.8.0 configure bearer: lets an adopting window push live
+        // bridge config (FIM/LM/editor-links) to this instance without a
+        // restart. Same 0600 file as authToken — same reader set.
+        ...(this.configureToken() ? { configureToken: this.configureToken() } : {}),
       });
     }
     // The plain URL stays canonical for every internal consumer; the tokened
@@ -1676,6 +1715,7 @@ class ServerManager {
         authToken,
         authUrl: `http://${host}:${port}/?token=${encodeURIComponent(authToken)}`,
       } : {}),
+      ...(this.configureToken() ? { configureToken: this.configureToken() } : {}),
     };
     this._ownedServer = server;
     this._emit('ready', 'DSH web ready: http://{host}:{port} (pid={pid})', { host, port, pid }, server);
