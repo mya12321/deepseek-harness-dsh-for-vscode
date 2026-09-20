@@ -1,7 +1,7 @@
 # Known Issues / 问题记录
 
-> 更新日期：2026-09-19 · 对应版本：**1.2.0（开发中）** · 当前**0 个未修复已知问题**
-> Updated 2026-09-19 · tracks in-development **1.2.0** · **0 open issues**
+> 更新日期：2026-09-20 · 对应版本：**1.2.0（开发中）** · 当前**0 个未修复已知问题**
+> Updated 2026-09-20 · tracks in-development **1.2.0** · **0 open issues**
 
 迁移说明：1.2.0 已把扩展迁移到 typert 线上协议，并要求 dsh ≥ 0.1.5-rc.2——斜杠式 JSON-RPC + `/api/remote.mux` WebSocket，旧式 `session.list` / `workspace.list` / `events.mux` / `session.export` 端点全部移除、无降级（见 [CHANGELOG.md](CHANGELOG.md)）。`session/prompt` 请求 id 改为客户端生成；会话回填改走 follow 快照的 `records`。
 Migration note: 1.2.0 hardcodes the typert wire protocol and requires dsh ≥ 0.1.5-rc.2 — slashed JSON-RPC plus `/api/remote.mux` WebSocket; the legacy `session.list` / `workspace.list` / `events.mux` / `session.export` endpoints are gone with no fallback. `session/prompt` request ids are client-minted and the changes-view backfill reads the follow snapshot's `records`.
@@ -46,6 +46,17 @@ Past issues and their fixes (details in the changelog and dev notes):
   Verify ⌘C with a selection over message text, and again with a selection inside the chat composer.
 - 主题验收：切换 VS Code 亮/暗主题，DSH 侧栏应实时跟随；卸载/禁用扩展后 DSH 恢复其自身主题偏好。
   Verify theme-follow by toggling the VS Code light/dark theme; on dispose the DSH preference is restored.
+
+## 验收提示 / Verification notes（多窗口同时启动竞态，2026-09-20 修复）
+
+- 「多窗口同时启动时有的窗口 dsh 起不来」的另一处根因：N 个窗口同时激活都会探测到共享端口空闲并各自 spawn，输掉端口竞争的窗口只有**一次**收养尝试，而赢家实例要等 HTTP 监听 + 赢家窗口把带 `authToken` 的注册表条目落盘（健康轮询 700ms 节拍）才可收养——真实 socket 复现输家 t+304ms 失败、赢家 t+1755ms 才就绪，窗口停在「DeepSeek Harness unavailable」等手点 Retry。现已改为有界 settle 收养（重探测 + 每轮重读注册表 token），并把实例注册表写改原子发布 + 跨进程文件锁（并发激活曾丢掉刚落盘的赢家条目，连带 token，实例从此对所有窗口不可收养）。
+  The other root cause of "some windows fail to start DSH when many windows launch at once": N simultaneously activating windows all probe the shared port free and spawn; a port-race loser got exactly ONE adoption attempt while the winner becomes adoptable only after its HTTP listener is up AND its window finalized the registry entry carrying the `authToken` (health poll, 700ms cadence). Real-socket repro: loser failed at t+304ms, winner adoptable at t+1755ms, window stuck on "DeepSeek Harness unavailable" until a manual Retry. Adoption now settles with a bounded re-probe loop that re-reads the registry token each round, and registry writes are atomic publishes behind a cross-process file lock (concurrent activations used to drop the winner's fresh entry — token included — leaving that instance unadoptable by every window).
+- 验证：同环境开 5+ 个窗口同时启动（Windows 与 WSL 各试一组）→ 不应再有窗口停留在错误页；`ps` 里每个环境只有一个 `dsh/lib/bin.js --port …`；`dsh-instances.json` 恰好一条该端口条目且 `authToken` 完好；状态栏各窗口分别显示 managed/reused。真实启动失败的窗口（无兄弟、坏运行时）仍应在约 2 秒内报 `SPAWN_EXITED_EARLY`，而非空等。
+  Verify: launch 5+ windows of one environment simultaneously (try a Windows set and a WSL set) → no window should stick on the error page; `ps` shows exactly one `dsh/lib/bin.js --port …` per environment; `dsh-instances.json` holds exactly one entry for that port with an intact `authToken`; status bars report managed/reused accordingly. A genuine startup failure (no sibling, broken runtime) must still surface `SPAWN_EXITED_EARLY` within ~2s instead of idling.
+- 手动复现脚本：`node test/manual/simultaneous-start-race.demo.js`（修复前 FAILED，修复后 ADOPTED）；回归测试 `test/unit/simultaneousStart.test.js`。
+  Manual reproduction: `node test/manual/simultaneous-start-race.demo.js` (FAILED before the fix, ADOPTED after); regression tests in `test/unit/simultaneousStart.test.js`.
+- 残留边界（非本次修复范围）：多个 **WSL 发行版** 各有独立扩展注册表但共享同一 WSL2 网络命名空间——跨发行版窗口探测到彼此实例却拿不到对方注册表里的 token，仍会各起一个（每个发行版一个）；如需完全收敛，可为 `dsh.home.path` 指定跨发行版共享目录或将各发行版的 `dsh.port` 显式错开。
+  Residual edge (out of scope for this fix): multiple **WSL distros** keep per-distro extension registries while sharing one WSL2 network namespace — a window in distro B sees distro A's instance but cannot recover its token from B's registry, so each distro still converges on its own instance; for full convergence, point `dsh.home.path` at a shared location or pin distinct `dsh.port` values per distro.
 
 ## 验收提示 / Verification notes（跨窗口共享，2026-09-18 修复）
 

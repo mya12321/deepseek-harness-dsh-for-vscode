@@ -63,6 +63,29 @@ const TASKKILL_TIMEOUT_MS = 5000; // max wait for taskkill /T /F before stop() p
 const PORT_RELEASE_WAIT_MS = 3000; // F-f: max stop() wait for a killed child's port to refuse
 const PORT_RELEASE_POLL_MS = 100; // F-f: poll cadence for the port-release wait
 
+// Simultaneous-start settle budgets (multi-window shared mode). When a sibling
+// window wins the port race, its DSH binds the port well before the extension
+// finalizes the registry entry (the token source adopters need) — the loser's
+// single adoption attempt used to expire in ~1s and the window showed
+// "DeepSeek Harness unavailable" until a manual Retry (live bug 2026-09-18,
+// N windows starting at once). The settle loop re-probes and re-reads the
+// registry each round until the sibling becomes adoptable or the budget ends.
+const ADOPTION_SETTLE_POLL_MS = 500;      // settle re-probe cadence
+const SPAWN_RACE_SETTLE_MS = 12000;       // Step C catch: sibling proven/present
+const SPAWN_RACE_SETTLE_NO_SIBLING_MS = 2000; // Step C catch: no sibling evidence
+const DISCOVERY_SETTLE_MS = 4000;         // Step A/B: give a booting sibling a moment
+
+// Instance-registry inter-process locking. Every registry mutation is a
+// read-modify-write of the whole JSON file; with N windows activating at once
+// (sweeps, cleanup, adopter registration, ready-merge all concurrent) a plain
+// read→write pair silently drops sibling entries — worst case the freshly
+// written entry of the race winner, whose launch token every later adopter
+// needs. The lock is best-effort bookkeeping protection: on timeout it proceeds
+// unlocked rather than breaking startup.
+const REGISTRY_LOCK_POLL_MS = 5;     // sync spin cadence while locked by a peer
+const REGISTRY_LOCK_TIMEOUT_MS = 3000; // max wait for a peer lock before going unlocked
+const REGISTRY_LOCK_STALE_MS = 3000; // a lock older than this is taken over
+
 /** Bound on the spawn-log excerpt embedded in early-exit error messages. */
 const EXCERPT_MAX_BYTES = 1600;
 /** Lines of the spawn-log excerpt embedded in early-exit error messages. */
@@ -605,55 +628,72 @@ class ServerManager {
    * activation sweep read that list to keep a shared instance alive while
    * any adopting window is still attached.
    *
+   * `options.settleMs` bounds a re-probe loop for the simultaneous-start
+   * race: a sibling window's instance answers 401 (fenced) before its own
+   * window has finalized the registry entry, so the first pass finds no
+   * launch token and cannot adopt. Each round re-probes and re-reads the
+   * registry, so a booting sibling is adopted the moment its token lands.
+   * 0 (default) keeps the single-shot behavior.
+   *
    * @param {string} host - DSH endpoint host.
    * @param {number} port - DSH endpoint port.
    * @param {object} [options]
    * @param {string|null} [options.registryFile] - Instance registry path for
    *   adopter bookkeeping and launch-token recovery; null (default) keeps the
    *   legacy no-bookkeeping behavior.
+   * @param {number} [options.settleMs] - Bounded wait (ms) re-probing until
+   *   the endpoint becomes adoptable; 0 = single-shot.
    * @returns {Promise<object|null>} RunningServer handle, or null.
    */
-  async adoptRunningDsh(host, port, { registryFile = null } = {}) {
-    try {
-      this._emit('probing', 'Probing DSH service: http://{host}:{port}…', { host, port });
-      let result = await this.probeWithRetry(host, port);
-      let token = null;
-      if (result && result.reachable && !result.isDsh) {
-        // Reachable but not recognized: on dsh 0.1.2+ this is the auth fence
-        // answering 401. Retry with the owning window's launch token.
-        token = ServerManager._launchTokenFromRegistry(registryFile, host, port);
-        if (token) {
-          const withToken = await this.probeWithRetry(host, port, { token });
-          if (withToken && withToken.reachable && withToken.isDsh) result = withToken;
-          else token = null; // token rejected: do not attach it to the handle
+  async adoptRunningDsh(host, port, { registryFile = null, settleMs = 0 } = {}) {
+    const deadline = Date.now() + Math.max(0, settleMs);
+    for (let round = 0; ; round++) {
+      try {
+        // Emit the probing stage only once: the settle loop may run for
+        // seconds and re-rendering the status page every round is churn.
+        if (round === 0) {
+          this._emit('probing', 'Probing DSH service: http://{host}:{port}…', { host, port });
         }
-      }
-      if (result && result.reachable && result.isDsh) {
-        this._emit('reusing', 'Found a running DSH instance at http://{host}:{port}, reusing', { host, port });
-        this._startHealthWatch(host, port, token);
-        const managedEntry = ServerManager._managedEntryFromRegistry(registryFile, host, port);
-        const handle = this._reuseHandle(host, port, token, managedEntry
-          ? {
-            pid: managedEntry.pid,
-            managed: true,
-            // Plugin 0.8.0: the spawning window's configure bearer, so this
-            // adopting window can push live bridge config to the instance.
-            configureToken: typeof managedEntry.configureToken === 'string' ? managedEntry.configureToken : null,
+        let result = await this.probeWithRetry(host, port);
+        let token = null;
+        if (result && result.reachable && !result.isDsh) {
+          // Reachable but not recognized: on dsh 0.1.2+ this is the auth fence
+          // answering 401. Retry with the owning window's launch token.
+          token = ServerManager._launchTokenFromRegistry(registryFile, host, port);
+          if (token) {
+            const withToken = await this.probeWithRetry(host, port, { token });
+            if (withToken && withToken.reachable && withToken.isDsh) result = withToken;
+            else token = null; // token rejected: do not attach it to the handle
           }
-          : null);
-        if (!handle.owned) {
-          ServerManager._registerAdopter(registryFile, {
-            port,
-            vscodePid: this.ownerVscodePid,
-            windowId: this.ownerWindowId,
-          });
         }
-        return handle;
+        if (result && result.reachable && result.isDsh) {
+          this._emit('reusing', 'Found a running DSH instance at http://{host}:{port}, reusing', { host, port });
+          this._startHealthWatch(host, port, token);
+          const managedEntry = ServerManager._managedEntryFromRegistry(registryFile, host, port);
+          const handle = this._reuseHandle(host, port, token, managedEntry
+            ? {
+              pid: managedEntry.pid,
+              managed: true,
+              // Plugin 0.8.0: the spawning window's configure bearer, so this
+              // adopting window can push live bridge config to the instance.
+              configureToken: typeof managedEntry.configureToken === 'string' ? managedEntry.configureToken : null,
+            }
+            : null);
+          if (!handle.owned) {
+            ServerManager._registerAdopter(registryFile, {
+              port,
+              vscodePid: this.ownerVscodePid,
+              windowId: this.ownerWindowId,
+            });
+          }
+          return handle;
+        }
+      } catch {
+        // The caller keeps its original error and decides whether to surface it.
       }
-    } catch {
-      // The caller keeps its original error and decides whether to surface it.
+      if (Date.now() >= deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, ADOPTION_SETTLE_POLL_MS));
     }
-    return null;
   }
 
   /**
@@ -888,7 +928,7 @@ class ServerManager {
    *    answer on the configured port is adopted (never spawned past), then
    *    this environment's own `dsh web` processes are discovered and probed
    *    (see _ensureSharedEnvironmentServer). Spawning happens only when
-   *    nothing answers, followed by one adoption retry that settles a
+   *    nothing answers, followed by a bounded adoption wait that settles a
    *    simultaneous-start race between sibling windows. autoStart === false
    *    keeps the strict user-managed semantics in this mode as well.
    *  - A non-DSH occupant scans from port + 1; an unreachable port scans from
@@ -998,8 +1038,10 @@ class ServerManager {
    *    configured port when free (so later windows find it exactly there),
    *    scanning forward only past a non-DSH occupant. A simultaneous-start
    *    race — a sibling window binds the port between our probe and our
-   *    spawn, our child dies of EADDRINUSE — is settled by one more adoption
-   *    round before the spawn error stands.
+   *    spawn, our child dies of EADDRINUSE — is settled by a bounded adoption
+   *    wait (settleMs) before the spawn error stands: the winner binds the
+   *    port before its registry token exists, so the loser must re-probe
+   *    until the winner becomes adoptable, not just once.
    *
    * The spawning window owns the child (registry entry with its vscodePid);
    * adopters register themselves as attachers so the owner's exit path can
@@ -1027,18 +1069,34 @@ class ServerManager {
     // spawned their own DSH, 3081 and 3082). adoptRunningDsh retries the probe
     // with the launch token recovered from the instance registry and returns
     // null for a genuinely foreign endpoint, which falls through to Step B/C
-    // unchanged.
+    // unchanged. A bounded settle covers the sibling mid-boot: it answers 401
+    // before its own window has written the registry token, so the first pass
+    // alone cannot adopt it (multi-window simultaneous start).
     if (probeResult.reachable) {
-      const adopted = await this.adoptRunningDsh(host, port, { registryFile });
+      const adopted = await this.adoptRunningDsh(host, port, {
+        registryFile,
+        settleMs: DISCOVERY_SETTLE_MS,
+      });
       if (adopted) return adopted;
     }
 
     // Step B: discover this environment's own `dsh web` listeners elsewhere.
+    //
+    // The configured port is NOT skipped unconditionally anymore: when our own
+    // probe found it bound-but-silent (a booting sibling — 'timeout', or
+    // another indeterminate state) and the process scan confirms a dsh on
+    // exactly that port, adoption must be attempted on it too, or the spawn
+    // below scans forward and brings up a duplicate instance (the silent
+    // 3081/3082 shape of the 2026-09-18 race). A plain 'refused' still skips:
+    // nothing is there, spawning is correct.
     if (autoStart && typeof discoverDshWebPorts === 'function') {
       for (const candidate of await this._discoverEnvironmentDshPorts(discoverDshWebPorts)) {
-        if (candidate === port) continue;
+        if (candidate === port && (probeResult.reachable || probeResult.reason === 'refused')) continue;
         this._throwIfCancelled(generation);
-        const adopted = await this.adoptRunningDsh(host, candidate, { registryFile });
+        const adopted = await this.adoptRunningDsh(host, candidate, {
+          registryFile,
+          settleMs: DISCOVERY_SETTLE_MS,
+        });
         if (adopted) return adopted;
       }
     }
@@ -1047,17 +1105,35 @@ class ServerManager {
       throw new ServerError(STARTUP_ERRORS.AUTOSTART_DISABLED.template, {}, 'AUTOSTART_DISABLED');
     }
 
-    // Step C: spawn, then settle a start race with one adoption retry.
+    // Step C: spawn, then settle a start race with one bounded adoption wait.
     try {
       return await this._spawnOnFreePort({ host, port, cwd, registryFile, generation, probeResult });
     } catch (spawnError) {
       this._throwIfCancelled(generation);
-      const raced = await this.adoptRunningDsh(host, port, { registryFile });
+      // Settle a simultaneous-start race: the sibling that beat us to the port
+      // is bound well before its registry entry (the adoptable token) lands,
+      // and its boot can take seconds under N-window startup load. Scale the
+      // settle budget by the evidence that a sibling actually exists — a
+      // genuine spawn failure (broken runtime, no sibling) must still fail
+      // fast instead of idling for the full budget.
+      const postMortem = await this.probe(host, port).catch(() => ({ reachable: false, reason: 'error' }));
+      let siblingOnPort = postMortem.reachable || postMortem.reason !== 'refused';
+      if (!siblingOnPort && typeof discoverDshWebPorts === 'function') {
+        const ports = await this._discoverEnvironmentDshPorts(discoverDshWebPorts);
+        siblingOnPort = ports.includes(port);
+      }
+      const raced = await this.adoptRunningDsh(host, port, {
+        registryFile,
+        settleMs: siblingOnPort ? SPAWN_RACE_SETTLE_MS : SPAWN_RACE_SETTLE_NO_SIBLING_MS,
+      });
       if (raced) return raced;
       if (typeof discoverDshWebPorts === 'function') {
         for (const candidate of await this._discoverEnvironmentDshPorts(discoverDshWebPorts)) {
-          if (candidate === port) continue;
-          const adopted = await this.adoptRunningDsh(host, candidate, { registryFile });
+          if (candidate === port) continue; // just settled above with the full budget
+          const adopted = await this.adoptRunningDsh(host, candidate, {
+            registryFile,
+            settleMs: DISCOVERY_SETTLE_MS,
+          });
           if (adopted) return adopted;
         }
       }
@@ -1231,6 +1307,75 @@ class ServerManager {
   }
 
   /**
+   * Bounded synchronous sleep used only while waiting for a peer registry
+   * lock (all registry mutations are sync read-modify-writes). Atomics.wait
+   * parks the thread without a busy loop; hosts that forbid it fall back to
+   * a short bounded spin.
+   */
+  static _sleepSync(ms) {
+    if (!ServerManager._sleepBuffer) ServerManager._sleepBuffer = new SharedArrayBuffer(4);
+    try {
+      Atomics.wait(new Int32Array(ServerManager._sleepBuffer), 0, 0, Math.max(0, ms));
+      return;
+    } catch {
+      // Atomics.wait unavailable here: bounded busy spin below.
+    }
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* spin */ }
+  }
+
+  /**
+   * Best-effort inter-process lock guarding every registry read-modify-write.
+   * With N windows activating simultaneously (sweep, stale cleanup, adopter
+   * registration, ready-merge all at once) an unlocked read→write pair drops
+   * sibling entries — worst case the race winner's freshly written entry,
+   * whose launch token every later adopter needs to attach at all. Returns
+   * the lock path, or null when the caller must proceed unlocked (lock
+   * unusable, or a peer held it past the timeout): registry bookkeeping is
+   * best-effort and must never block startup.
+   */
+  static _acquireRegistryLock(registryFile) {
+    const lockPath = `${registryFile}.lock`;
+    const deadline = Date.now() + REGISTRY_LOCK_TIMEOUT_MS;
+    for (;;) {
+      try {
+        const fd = fs.openSync(lockPath, 'wx');
+        try { fs.writeSync(fd, String(process.pid)); } catch { /* contents are advisory */ }
+        try { fs.closeSync(fd); } catch { /* already closed */ }
+        return lockPath;
+      } catch (err) {
+        if (!err || err.code !== 'EEXIST') return null; // cannot lock here: proceed unlocked
+        try {
+          if (Date.now() - fs.statSync(lockPath).mtimeMs > REGISTRY_LOCK_STALE_MS) {
+            try { fs.unlinkSync(lockPath); } catch { /* a peer released it first */ }
+          }
+        } catch {
+          // vanished between open and stat: retry immediately
+        }
+        if (Date.now() >= deadline) return null;
+        ServerManager._sleepSync(REGISTRY_LOCK_POLL_MS);
+      }
+    }
+  }
+
+  /** Release the registry lock (best-effort; a stale lock self-expires). */
+  static _releaseRegistryLock(lockPath) {
+    if (!lockPath) return;
+    try { fs.unlinkSync(lockPath); } catch { /* already gone / taken over */ }
+  }
+
+  /** Run fn() while holding the registry lock; proceeds unlocked on timeout. */
+  static _withRegistryLock(registryFile, fn) {
+    if (!registryFile) return fn();
+    const lockPath = ServerManager._acquireRegistryLock(registryFile);
+    try {
+      return fn();
+    } finally {
+      ServerManager._releaseRegistryLock(lockPath);
+    }
+  }
+
+  /**
    * Best-effort write of the registry array (creates the parent directory).
    *
    * Mode 0600: entries carry the instance's launch token (see _finalizeReady)
@@ -1240,11 +1385,29 @@ class ServerManager {
    * and re-asserted on every write (an existing file keeps its old mode
    * otherwise); on Windows the mode argument is ignored, which the platform's
    * per-user profile ACLs already cover.
+   *
+   * The write is an atomic publish (temp file + rename): concurrent readers
+   * in sibling windows must never observe a torn file. A truncated registry
+   * used to read as unparseable, and cleanupStaleRegistry then deleted the
+   * whole file — erasing the race winner's entry and launch token, after
+   * which no window could adopt that instance and every one spawned its own.
    */
   static _writeRegistry(registryFile, entries) {
     try {
       fs.mkdirSync(path.dirname(path.resolve(registryFile)), { recursive: true });
-      fs.writeFileSync(registryFile, JSON.stringify(entries, null, 2) + '\n', { mode: 0o600 });
+      const payload = JSON.stringify(entries, null, 2) + '\n';
+      const temporary = `${registryFile}.${process.pid}.${Date.now()}.tmp`;
+      try {
+        fs.writeFileSync(temporary, payload, { mode: 0o600 });
+        try { fs.chmodSync(temporary, 0o600); } catch { /* non-POSIX */ }
+        fs.renameSync(temporary, registryFile);
+        return;
+      } catch {
+        try { fs.unlinkSync(temporary); } catch { /* already gone */ }
+        // rename failed (platform quirk / AV interference): fall through to
+        // the legacy in-place write rather than losing the bookkeeping.
+      }
+      fs.writeFileSync(registryFile, payload, { mode: 0o600 });
       try {
         fs.chmodSync(registryFile, 0o600);
       } catch {
@@ -1258,20 +1421,24 @@ class ServerManager {
   /** Merge one entry into the registry: replaces any same-port entry, keeps the rest. */
   static _mergeRegistry(registryFile, entry) {
     if (!registryFile) return;
-    const entries = ServerManager._readRegistry(registryFile).filter(
-      (e) => !(e && e.port === entry.port)
-    );
-    entries.push(entry);
-    ServerManager._writeRegistry(registryFile, entries);
+    ServerManager._withRegistryLock(registryFile, () => {
+      const entries = ServerManager._readRegistry(registryFile).filter(
+        (e) => !(e && e.port === entry.port)
+      );
+      entries.push(entry);
+      ServerManager._writeRegistry(registryFile, entries);
+    });
   }
 
   /** Remove ONLY the entry with the given pid; other windows' entries stay. */
   static _removeRegistryEntry(registryFile, pid) {
     if (!registryFile) return;
-    const entries = ServerManager._readRegistryRaw(registryFile).filter(
-      (e) => !(e && e.pid === pid)
-    );
-    ServerManager._writeRegistry(registryFile, entries);
+    ServerManager._withRegistryLock(registryFile, () => {
+      const entries = ServerManager._readRegistryRaw(registryFile).filter(
+        (e) => !(e && e.pid === pid)
+      );
+      ServerManager._writeRegistry(registryFile, entries);
+    });
   }
 
   /**
@@ -1295,20 +1462,22 @@ class ServerManager {
     if (!registryFile || !Number.isInteger(port)) return;
     const adopter = ServerManager._normalizeAdopter({ vscodePid, windowId });
     if (adopter.vscodePid === null && adopter.windowId === null) return;
-    const entries = ServerManager._readRegistryRaw(registryFile);
-    let changed = false;
-    for (const entry of entries) {
-      if (!entry || entry.port !== port || !ServerManager._isProcessAlive(entry.pid)) continue;
-      const attachers = Array.isArray(entry.attachers) ? [...entry.attachers] : [];
-      const duplicate = attachers.some((a) => a && (
-        adopter.vscodePid !== null ? a.vscodePid === adopter.vscodePid : a.windowId === adopter.windowId
-      ));
-      if (duplicate) continue;
-      attachers.push(adopter);
-      entry.attachers = attachers;
-      changed = true;
-    }
-    if (changed) ServerManager._writeRegistry(registryFile, entries);
+    ServerManager._withRegistryLock(registryFile, () => {
+      const entries = ServerManager._readRegistryRaw(registryFile);
+      let changed = false;
+      for (const entry of entries) {
+        if (!entry || entry.port !== port || !ServerManager._isProcessAlive(entry.pid)) continue;
+        const attachers = Array.isArray(entry.attachers) ? [...entry.attachers] : [];
+        const duplicate = attachers.some((a) => a && (
+          adopter.vscodePid !== null ? a.vscodePid === adopter.vscodePid : a.windowId === adopter.windowId
+        ));
+        if (duplicate) continue;
+        attachers.push(adopter);
+        entry.attachers = attachers;
+        changed = true;
+      }
+      if (changed) ServerManager._writeRegistry(registryFile, entries);
+    });
   }
 
   /**
@@ -1320,22 +1489,24 @@ class ServerManager {
     if (!registryFile) return;
     const target = ServerManager._normalizeAdopter({ vscodePid, windowId });
     if (target.vscodePid === null && target.windowId === null) return;
-    const entries = ServerManager._readRegistryRaw(registryFile);
-    let changed = false;
-    for (const entry of entries) {
-      if (!entry || !Array.isArray(entry.attachers) || entry.attachers.length === 0) continue;
-      const filtered = entry.attachers.filter((a) => {
-        if (!a || typeof a !== 'object') return true;
-        const pidMatch = target.vscodePid !== null && a.vscodePid === target.vscodePid;
-        const winMatch = target.windowId !== null && a.windowId === target.windowId;
-        return !(pidMatch || winMatch);
-      });
-      if (filtered.length !== entry.attachers.length) {
-        entry.attachers = filtered;
-        changed = true;
+    ServerManager._withRegistryLock(registryFile, () => {
+      const entries = ServerManager._readRegistryRaw(registryFile);
+      let changed = false;
+      for (const entry of entries) {
+        if (!entry || !Array.isArray(entry.attachers) || entry.attachers.length === 0) continue;
+        const filtered = entry.attachers.filter((a) => {
+          if (!a || typeof a !== 'object') return true;
+          const pidMatch = target.vscodePid !== null && a.vscodePid === target.vscodePid;
+          const winMatch = target.windowId !== null && a.windowId === target.windowId;
+          return !(pidMatch || winMatch);
+        });
+        if (filtered.length !== entry.attachers.length) {
+          entry.attachers = filtered;
+          changed = true;
+        }
       }
-    }
-    if (changed) ServerManager._writeRegistry(registryFile, entries);
+      if (changed) ServerManager._writeRegistry(registryFile, entries);
+    });
   }
 
   /**
@@ -1821,24 +1992,31 @@ class ServerManager {
    * Clean up a stale registry file: read it, write back only the entries
    * whose process is still alive, and NEVER kill any process (a live DSH may
    * belong to another VS Code window). A missing or corrupt file is removed.
+   *
+   * Runs under the registry lock: every activating window executes this, and
+   * an unlocked prune concurrent with the race winner's ready-merge used to
+   * erase that winner's fresh entry (and its launch token) for good.
    */
   static cleanupStaleRegistry(registryFile) {
-    let parsed = null;
-    try {
-      parsed = JSON.parse(fs.readFileSync(registryFile, 'utf8'));
-    } catch {
-      parsed = null; // missing or unparseable
-    }
-    if (!Array.isArray(parsed)) {
-      // Missing / corrupt / legacy single-object file: nothing to salvage —
-      // remove it (best effort). A missing file raises ENOENT — ignored.
-      try { fs.unlinkSync(registryFile); } catch { /* ignore */ }
-      return;
-    }
-    const alive = parsed.filter((e) => e && ServerManager._isProcessAlive(e.pid));
-    if (alive.length !== parsed.length) {
-      ServerManager._writeRegistry(registryFile, alive);
-    }
+    ServerManager._withRegistryLock(registryFile, () => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(fs.readFileSync(registryFile, 'utf8'));
+      } catch {
+        parsed = null; // missing or unparseable
+      }
+      if (!Array.isArray(parsed)) {
+        // Missing / corrupt / legacy single-object file: nothing to salvage —
+        // remove it (best effort). A missing file raises ENOENT — ignored.
+        // Safe against torn reads since _writeRegistry publishes atomically.
+        try { fs.unlinkSync(registryFile); } catch { /* ignore */ }
+        return;
+      }
+      const alive = parsed.filter((e) => e && ServerManager._isProcessAlive(e.pid));
+      if (alive.length !== parsed.length) {
+        ServerManager._writeRegistry(registryFile, alive);
+      }
+    });
   }
 
   /**
@@ -1870,11 +2048,13 @@ class ServerManager {
    */
   static removeRegistryEntries(registryFile, pids) {
     if (!Array.isArray(pids) || pids.length === 0) return;
-    const wanted = new Set(pids);
-    const entries = ServerManager._readRegistryRaw(registryFile).filter(
-      (e) => !(e && wanted.has(e.pid))
-    );
-    ServerManager._writeRegistry(registryFile, entries);
+    ServerManager._withRegistryLock(registryFile, () => {
+      const wanted = new Set(pids);
+      const entries = ServerManager._readRegistryRaw(registryFile).filter(
+        (e) => !(e && wanted.has(e.pid))
+      );
+      ServerManager._writeRegistry(registryFile, entries);
+    });
   }
 
   /**
@@ -1898,6 +2078,12 @@ class ServerManager {
    * Reuses the exact tree-kill implementation that backs the orphan-cleanup
    * command (`killProcessTree`); nothing here re-implements process killing.
    *
+   * Locking: the read-and-decide pass runs under the registry lock (sibling
+   * windows mutate the same file while this sweep reads it); the tree-kills
+   * run OUTSIDE the lock (they can take seconds each and the lock must not
+   * stall every activating window), and the removal re-merges under a fresh
+   * lock pass so entries written concurrently are preserved.
+   *
    * @param {string} registryFile - Registry JSON path.
    * @param {object} [options]
    * @param {(pid: number) => Promise<void>} [options.terminate] - defaults to killProcessTree.
@@ -1908,54 +2094,81 @@ class ServerManager {
   static async sweepDeadOwnerEntries(registryFile, { terminate = null, isProcessAlive = null, currentVscodePid = null } = {}) {
     const kill = typeof terminate === 'function' ? terminate : (pid) => killProcessTree(pid);
     const alive = typeof isProcessAlive === 'function' ? isProcessAlive : (pid) => ServerManager._isProcessAlive(pid);
-    const keep = [];
-    const swept = [];
-    let attachersPruned = false;
-    for (const entry of ServerManager._readRegistryRaw(registryFile)) {
-      if (!entry || !Number.isInteger(entry.pid)) {
-        keep.push(entry);
-        continue;
-      }
-      const owner = entry.vscodePid;
-      if (!Number.isInteger(owner) || owner <= 0) {
-        // Legacy / ownerless: compatible read, leave to dead-pid pruning.
-        keep.push(entry);
-        continue;
-      }
-      if (currentVscodePid !== null && currentVscodePid !== undefined && owner === currentVscodePid) {
-        keep.push(entry);
-        continue;
-      }
-      if (alive(owner)) {
-        // Owner extension-host is alive: never touch another window's child.
-        keep.push(entry);
-        continue;
-      }
-      // Owner is dead: shared-mode adopters keep the instance alive until
-      // the last of them exits; only then is the orphan reclaimed.
-      if (Array.isArray(entry.attachers) && entry.attachers.length > 0) {
-        const live = entry.attachers.filter((a) => a
-          && Number.isInteger(a.vscodePid)
-          && a.vscodePid > 0
-          && alive(a.vscodePid));
-        if (live.length > 0) {
-          entry.attachers = live;
-          attachersPruned = true;
+
+    // Pass 1 (locked): decide which entries stay and which are orphaned.
+    const decision = ServerManager._withRegistryLock(registryFile, () => {
+      const keep = [];
+      const swept = [];
+      let attachersPruned = false;
+      for (const entry of ServerManager._readRegistryRaw(registryFile)) {
+        if (!entry || !Number.isInteger(entry.pid)) {
           keep.push(entry);
           continue;
         }
+        const owner = entry.vscodePid;
+        if (!Number.isInteger(owner) || owner <= 0) {
+          // Legacy / ownerless: compatible read, leave to dead-pid pruning.
+          keep.push(entry);
+          continue;
+        }
+        if (currentVscodePid !== null && currentVscodePid !== undefined && owner === currentVscodePid) {
+          keep.push(entry);
+          continue;
+        }
+        if (alive(owner)) {
+          // Owner extension-host is alive: never touch another window's child.
+          keep.push(entry);
+          continue;
+        }
+        // Owner is dead: shared-mode adopters keep the instance alive until
+        // the last of them exits; only then is the orphan reclaimed.
+        if (Array.isArray(entry.attachers) && entry.attachers.length > 0) {
+          const live = entry.attachers.filter((a) => a
+            && Number.isInteger(a.vscodePid)
+            && a.vscodePid > 0
+            && alive(a.vscodePid));
+          if (live.length > 0) {
+            entry.attachers = live;
+            attachersPruned = true;
+            keep.push(entry);
+            continue;
+          }
+        }
+        swept.push({ pid: entry.pid, port: entry.port, vscodePid: owner });
       }
+      // Pruned-attacher state is published under the same lock pass; orphaned
+      // entries stay in the file until their kills actually ran (pass 2), so
+      // a crash here cannot strand a live DSH with no registry record.
+      if (attachersPruned) {
+        ServerManager._writeRegistry(registryFile, keep);
+      }
+      return { keep, swept, attachersPruned };
+    });
+
+    // Pass 2 (unlocked): tree-kill the orphaned DSH processes.
+    for (const sweptEntry of decision.swept) {
       try {
-        await kill(entry.pid);
+        await kill(sweptEntry.pid);
       } catch {
-        // best-effort tree-kill; the record is still dropped below.
+        // best-effort tree-kill; the record is still dropped below
       }
-      swept.push({ pid: entry.pid, port: entry.port, vscodePid: owner });
     }
-    if (swept.length > 0 || attachersPruned) {
-      ServerManager._writeRegistry(registryFile, keep);
+
+    // Pass 3 (locked): drop the swept entries, preserving anything concurrent
+    // windows wrote meanwhile. Matching is pid AND owner: a brand-new entry
+    // that happened to reuse a swept pid (pid reuse) carries a different
+    // owner marker and survives.
+    if (decision.swept.length > 0) {
+      ServerManager._withRegistryLock(registryFile, () => {
+        const sweptKeys = new Set(decision.swept.map((s) => `${s.pid}:${s.vscodePid}`));
+        const survivors = ServerManager._readRegistryRaw(registryFile).filter((e) => {
+          if (!e || !Number.isInteger(e.pid)) return true;
+          return !sweptKeys.has(`${e.pid}:${e.vscodePid}`);
+        });
+        ServerManager._writeRegistry(registryFile, survivors);
+      });
     }
-    return swept;
+    return decision.swept;
   }
 }
 
