@@ -57,7 +57,25 @@ const BOOT_MARKER = typesModule && typesModule.BOOT_MARKER != null ? typesModule
 const PROBE_TIMEOUT_MS = 3000;   // per-probe socket timeout (generous for a busy DSH)
 const PORT_SCAN_LIMIT = 50;      // max ports scanned forward when the target is busy
 const HEALTH_POLL_MS = 700;      // interval between health checks after spawn
-const HEALTH_TIMEOUT_MS = 30000; // overall wait for the spawned service to become ready
+const HEALTH_TIMEOUT_MS = 30000; // overall wait for a WARM spawned service to become ready
+// Cold-start readiness budget (first spawn of an extension host). Under a
+// multi-window simultaneous start every window spawns its own dsh at once and
+// the first boot of the day pays for all of them: N node processes loading the
+// same dependency tree through a cold file cache plus antivirus scanning can
+// push even the eventual winner past the 30s warm budget — each window then
+// killed its own still-booting child (live logs 2026-09-20: chains of
+// "did not become ready within 30s" + 0-byte spawn logs, Windows). The child
+// exit event still fast-fails genuine breakage (SPAWN_EXITED_EARLY), so a
+// longer first-spawn deadline only trades idle waiting for fewer killed
+// healthy boots.
+const COLD_HEALTH_TIMEOUT_MS = 120000;
+// Mid-wait sibling adoption cadence (shared mode): while OUR child is still
+// booting, re-check whether a sibling window's instance already became
+// adoptable; if so, abandon our doomed duplicate boot and adopt instead. This
+// is what actually collapses the N-concurrent-boot storm — without it every
+// window burns a full dsh boot's worth of disk/AV contention on a child that
+// is going to lose the port race anyway.
+const SIBLING_ADOPT_POLL_ROUNDS = 4; // ≈ every 2.8s of the 700ms health poll
 const MAX_BODY_BYTES = 5 * 1024 * 1024; // bound on the probe response body we buffer
 const TASKKILL_TIMEOUT_MS = 5000; // max wait for taskkill /T /F before stop() proceeds
 const PORT_RELEASE_WAIT_MS = 3000; // F-f: max stop() wait for a killed child's port to refuse
@@ -90,6 +108,9 @@ const REGISTRY_LOCK_STALE_MS = 3000; // a lock older than this is taken over
 const EXCERPT_MAX_BYTES = 1600;
 /** Lines of the spawn-log excerpt embedded in early-exit error messages. */
 const EXCERPT_MAX_LINES = 10;
+
+/** Liveness-answer TTL (see ServerManager._isProcessAlive). */
+const ALIVE_CACHE_TTL_MS = 1500;
 
 /**
  * Turn a spawn-log tail into the ''-or-'\n\n…' suffix used by the early-exit
@@ -403,6 +424,7 @@ class ServerManager {
     this._ownedServer = null; // last ready endpoint backed by this._child
     this._cancelGeneration = 0; // invalidates an in-flight ensure/spawn operation
     this._lastSpawnPort = null; // last port spawned by THIS instance (fresh origin)
+    this._hasEverBeenReady = false; // first successful spawn switches to the warm readiness budget
   }
 
   /**
@@ -643,15 +665,18 @@ class ServerManager {
    *   legacy no-bookkeeping behavior.
    * @param {number} [options.settleMs] - Bounded wait (ms) re-probing until
    *   the endpoint becomes adoptable; 0 = single-shot.
+   * @param {boolean} [options.silent] - Skip the "Probing DSH service" status
+   *   emission (used by the mid-wait sibling adoption inside the spawn health
+   *   poll, where a re-rendered probing page every few seconds is churn).
    * @returns {Promise<object|null>} RunningServer handle, or null.
    */
-  async adoptRunningDsh(host, port, { registryFile = null, settleMs = 0 } = {}) {
+  async adoptRunningDsh(host, port, { registryFile = null, settleMs = 0, silent = false } = {}) {
     const deadline = Date.now() + Math.max(0, settleMs);
     for (let round = 0; ; round++) {
       try {
         // Emit the probing stage only once: the settle loop may run for
         // seconds and re-rendering the status page every round is churn.
-        if (round === 0) {
+        if (round === 0 && !silent) {
           this._emit('probing', 'Probing DSH service: http://{host}:{port}…', { host, port });
         }
         let result = await this.probeWithRetry(host, port);
@@ -1106,8 +1131,19 @@ class ServerManager {
     }
 
     // Step C: spawn, then settle a start race with one bounded adoption wait.
+    // The health poll also adopt-checks the configured port every few rounds
+    // (adoptSibling): as soon as a sibling window's instance becomes
+    // adoptable, this window abandons its own duplicate boot and attaches.
     try {
-      return await this._spawnOnFreePort({ host, port, cwd, registryFile, generation, probeResult });
+      return await this._spawnOnFreePort({
+        host,
+        port,
+        cwd,
+        registryFile,
+        generation,
+        probeResult,
+        adoptSibling: () => this.adoptRunningDsh(host, port, { registryFile, silent: true }),
+      });
     } catch (spawnError) {
       this._throwIfCancelled(generation);
       // Settle a simultaneous-start race: the sibling that beat us to the port
@@ -1161,7 +1197,7 @@ class ServerManager {
    * instance, never reuse the last port this instance spawned (fresh origin)
    * so DSH does not cache the previous workspace under the same origin.
    */
-  async _spawnOnFreePort({ host, port, cwd, registryFile, generation, probeResult }) {
+  async _spawnOnFreePort({ host, port, cwd, registryFile, generation, probeResult, adoptSibling = null }) {
     const occupied = probeResult.reachable || probeResult.reason !== 'refused';
     let scanStart = occupied ? port + 1 : port;
     if (this._lastSpawnPort !== null && scanStart <= this._lastSpawnPort) {
@@ -1170,7 +1206,7 @@ class ServerManager {
     const freePort = await this._findFreePort(host, scanStart);
     this._lastSpawnPort = freePort;
     this._throwIfCancelled(generation);
-    return this._spawnAndWait(host, freePort, cwd, registryFile, generation);
+    return this._spawnAndWait(host, freePort, cwd, registryFile, generation, { adoptSibling });
   }
 
   /**
@@ -1258,8 +1294,40 @@ class ServerManager {
    * tasklist cannot run (e.g. a sandboxed test environment), fall back to the
    * portable process.kill(pid, 0) probe. ESRCH ⇒ definitely gone (false);
    * anything undeterminable (EPERM, tasklist failure) ⇒ keep (true).
+   *
+   * Results are cached for a short TTL: every registry mutation filters its
+   * entries through this check INSIDE the cross-process lock, and one tasklist
+   * call costs ~50-150ms — with N windows activating simultaneously the hold
+   * time used to approach the lock timeout, past which the mutation proceeds
+   * UNLOCKED and silently drops sibling entries again (the race the lock was
+   * added to fix). A 1.5s stale-alive answer only ever delays bookkeeping
+   * (the next sweep catches up); it never gates a kill (the orphan sweep
+   * re-verifies process identity before terminating — see
+   * _processCreatedBeforeMs).
    */
   static _isProcessAlive(pid) {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    const now = Date.now();
+    if (!ServerManager._aliveCache) ServerManager._aliveCache = new Map();
+    const cached = ServerManager._aliveCache.get(pid);
+    if (cached && cached.until > now) return cached.alive;
+    const alive = ServerManager._isProcessAliveUncached(pid);
+    // Bound the map: drop expired entries once it grows past a few hundred pids.
+    if (ServerManager._aliveCache.size > 512) {
+      for (const [key, value] of ServerManager._aliveCache) {
+        if (value.until <= now) ServerManager._aliveCache.delete(key);
+      }
+    }
+    ServerManager._aliveCache.set(pid, { alive, until: now + ALIVE_CACHE_TTL_MS });
+    return alive;
+  }
+
+  /** Test/bookkeeping seam: forget every cached liveness answer. */
+  static _resetAliveCache() {
+    ServerManager._aliveCache = null;
+  }
+
+  static _isProcessAliveUncached(pid) {
     if (!Number.isInteger(pid) || pid <= 0) return false;
     if (process.platform === 'win32') {
       try {
@@ -1304,6 +1372,67 @@ class ServerManager {
     return ServerManager._readRegistryRaw(registryFile).filter(
       (e) => e && ServerManager._isProcessAlive(e.pid)
     );
+  }
+
+  /**
+   * Best-effort process-identity check: was the process `pid` created BEFORE
+   * `atMs` (the registry entry's write time)? Registry entries are written
+   * AFTER their child spawned, so the live process registered under a pid
+   * must predate its entry. A process created AFTER the entry was written is
+   * a REUSED pid (Windows recycles pids aggressively): killing it would
+   * murder an innocent — live incident 2026-09-20: a window's activation
+   * sweep tree-killed a dead-window entry (pid 13908) and, seconds later,
+   * that same window's OWN freshly spawned dsh — which Windows had assigned
+   * the very same recycled pid — died as "exited unexpectedly" while its
+   * ready line was already in the log.
+   *
+   * Returns true  — process exists and predates the entry: safe to terminate.
+   *         false — process exists but is younger than the entry: reused pid.
+   *         null  — could not determine (tool missing/failed): the caller
+   *                 keeps the legacy kill behavior rather than regressing
+   *                 orphan cleanup on exotic systems.
+   */
+  static _processCreatedBeforeMs(pid, atMs) {
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    if (!Number.isFinite(atMs) || atMs <= 0) return null;
+    if (process.platform === 'win32') {
+      let out;
+      try {
+        out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+          `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${Number(pid)}' -Property CreationDate; ` +
+          'if ($null -eq $p) { \'GONE\' } else { $p.CreationDate.ToFileTime() }',
+        ], {
+          encoding: 'utf8',
+          timeout: 8000,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+      } catch {
+        return null;
+      }
+      const answer = String(out).trim();
+      if (answer === 'GONE') return true; // nothing to kill; entry removal is still correct
+      const fileTime = Number(answer);
+      if (!Number.isFinite(fileTime) || fileTime <= 0) return null;
+      // FILETIME: 100ns ticks since 1601-01-01 UTC.
+      const createdMs = (fileTime - 116444736000000000) / 10000;
+      if (!Number.isFinite(createdMs)) return null;
+      return createdMs < atMs;
+    }
+    // POSIX: elapsed seconds of the live process (`etimes` on procps ps).
+    let out;
+    try {
+      out = execFileSync('ps', ['-o', 'etimes=', '-p', String(pid)], {
+        encoding: 'utf8',
+        timeout: 4000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return null;
+    }
+    const elapsedSeconds = Number(String(out).trim());
+    if (!Number.isFinite(elapsedSeconds) || elapsedSeconds < 0) return null;
+    return (Date.now() - elapsedSeconds * 1000) < atMs;
   }
 
   /**
@@ -1614,11 +1743,11 @@ class ServerManager {
    * follows the ensureServer contract: only an explicitly provided cwd is
    * used; otherwise the child inherits the extension host's current directory.
    */
-  async _spawnAndWait(host, port, cwd, registryFile, generation = this._cancelGeneration) {
+  async _spawnAndWait(host, port, cwd, registryFile, generation = this._cancelGeneration, options = {}) {
     this._throwIfCancelled(generation);
     this._applyRuntimeProfileGuard();
     try {
-      return await this._spawnWithPatchSelfHeal(host, port, cwd, registryFile, generation, true);
+      return await this._spawnWithPatchSelfHeal(host, port, cwd, registryFile, generation, true, options);
     } catch (err) {
       // --no-open self-heal: a runtime older than 0.1.0-rc.7 rejects the
       // flag through Commander's "unknown option" error and exits before
@@ -1630,7 +1759,7 @@ class ServerManager {
       if (!isNoOpenStderr(this._readLastSpawnLogTail())) throw err;
       this._noOpenSuppressed = true;
       try {
-        const server = await this._spawnWithPatchSelfHeal(host, port, cwd, registryFile, generation, true);
+        const server = await this._spawnWithPatchSelfHeal(host, port, cwd, registryFile, generation, true, options);
         this._selfHealCount += 1;
         this._emit('selfheal', 'DSH runtime rejected --no-open (older than 0.1.0-rc.7); retried without the flag');
         return server;
@@ -1669,14 +1798,14 @@ class ServerManager {
   // overlay was in effect, retry exactly once with the patch removed. A
   // successful retry continues transparently and is recorded for Diagnose;
   // a second early exit reports the original SPAWN_EXITED_EARLY error.
-  async _spawnWithPatchSelfHeal(host, port, cwd, registryFile, generation, usePatch) {
+  async _spawnWithPatchSelfHeal(host, port, cwd, registryFile, generation, usePatch, options = {}) {
     const hadPatch = usePatch && this._effectivePatchPath() != null;
     try {
-      return await this._spawnAttempt(host, port, cwd, registryFile, generation, usePatch);
+      return await this._spawnAttempt(host, port, cwd, registryFile, generation, usePatch, options);
     } catch (err) {
       if (!(hadPatch && err && err.code === 'SPAWN_EXITED_EARLY')) throw err;
       try {
-        const server = await this._spawnAttempt(host, port, cwd, registryFile, generation, false);
+        const server = await this._spawnAttempt(host, port, cwd, registryFile, generation, false, options);
         this._selfHealCount += 1;
         // The consequence is the point: the --patch overlay is what inserts
         // the dsh-vscode-integration plugin, and without it nothing consumes
@@ -1693,7 +1822,7 @@ class ServerManager {
     }
   }
 
-  _spawnAttempt(host, port, cwd, registryFile, generation = this._cancelGeneration, usePatch = true) {
+  _spawnAttempt(host, port, cwd, registryFile, generation = this._cancelGeneration, usePatch = true, options = {}) {
     this._throwIfCancelled(generation);
     if (!this.resolvedRuntime) {
       throw new ServerError('Managed DSH runtime is unavailable; install or verify it before auto-start');
@@ -1742,11 +1871,27 @@ class ServerManager {
     this._emit('starting', 'Starting DSH web (pid={pid}, port={port})…', { pid: child.pid, port });
 
     return new Promise((resolve, reject) => {
-      const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+      // Cold-start aware readiness budget: a first boot of the day can take
+      // far longer than the warm 30s (measured 55.7s cold vs ~9s warm on the
+      // reference machine) because N windows starting at once each load the
+      // whole dsh dependency tree through a cold file cache plus antivirus.
+      // Killing those children at 30s reset everyone's progress and produced
+      // chains of "did not become ready within 30s" — the multi-window
+      // "sometimes never starts" failure. Genuine breakage still fails fast:
+      // SPAWN_EXITED_EARLY is event-driven, not deadline-driven.
+      const readyTimeoutMs = Number.isFinite(options.readyTimeoutMs) && options.readyTimeoutMs > 0
+        ? options.readyTimeoutMs
+        : (this._hasEverBeenReady ? HEALTH_TIMEOUT_MS : COLD_HEALTH_TIMEOUT_MS);
+      const deadline = Date.now() + readyTimeoutMs;
       let settled = false;
+      let polls = 0;
 
       // Persistent listener: any exit NOT caused by stop() is unexpected and
-      // reported through onStatus (e.g. the service crashed after becoming ready).
+      // reported through onStatus (e.g. the service crashed after becoming
+      // ready). Deliberately NOT gated on the startup `settled` flag: after
+      // the ready promise resolves this listener is the lifetime crash
+      // reporter. Cleanup races are guarded by the _child identity check
+      // below (the deadline/cancel paths null _child before killing).
       const onUnexpectedExit = (code, signal) => {
         if (this._stopping) return;        // deliberate stop()
         if (this._child !== child) return; // already detached (timeout cleanup)
@@ -1814,15 +1959,52 @@ class ServerManager {
           return;
         }
 
+        // Shared-mode mid-wait sibling adoption: while OUR child is still
+        // booting, a sibling window's instance may already be serving the
+        // configured port. Once it becomes adoptable, abandon this duplicate
+        // boot and adopt — under an N-window cold start every window spawns
+        // its own slow boot, and only the first one to bind wins; adopting
+        // the moment the winner is adoptable keeps the losers from burning
+        // their full readiness budget on a child that must die of
+        // EADDRINUSE anyway.
+        polls += 1;
+        if (
+          typeof options.adoptSibling === 'function'
+          && polls % SIBLING_ADOPT_POLL_ROUNDS === 0
+          && child.exitCode === null
+          && child.signalCode === null
+        ) {
+          try {
+            const adopted = await options.adoptSibling();
+            if (!settled && adopted) {
+              settled = true;
+              if (this._child === child) this._child = null;
+              this._ownedServer = null;
+              child.removeListener('exit', onUnexpectedExit);
+              await this._killChild(child); // abandon our duplicate boot
+              resolve(adopted);
+              return;
+            }
+          } catch {
+            // sibling adoption is opportunistic; keep waiting for our child
+          }
+          if (settled) return;
+        }
+
         if (Date.now() >= deadline) {
           settled = true;
           this._child = null;
           this._ownedServer = null;
           child.removeListener('exit', onUnexpectedExit);
           await this._killChild(child); // best-effort cleanup of the hung process
+          // The killed child's port can keep answering for a moment; without
+          // this wait an immediate Retry probes a lingering listener,
+          // classifies the port as occupied, and drifts the replacement spawn
+          // one port up (field logs: 3080 → 3081 → 3082 retry chains).
+          await this._waitForPortRefused(host, port, PORT_RELEASE_WAIT_MS);
           reject(new ServerError(
             STARTUP_ERRORS.HEALTH_TIMEOUT.template,
-            { seconds: HEALTH_TIMEOUT_MS / 1000, pid: child.pid },
+            { seconds: readyTimeoutMs / 1000, pid: child.pid },
             'HEALTH_TIMEOUT'
           ));
           return;
@@ -1842,6 +2024,7 @@ class ServerManager {
    */
   _finalizeReady(host, port, cwd, pid, registryFile, logPath = null, authToken = null) {
     this._registryFile = registryFile || null;
+    this._hasEverBeenReady = true; // warm boot from here on: 30s readiness budget
     if (registryFile) {
       const entryCwd = cwd === null || cwd === undefined || cwd === '' ? null : cwd;
       ServerManager._mergeRegistry(registryFile, {
@@ -2088,10 +2271,15 @@ class ServerManager {
    * @param {object} [options]
    * @param {(pid: number) => Promise<void>} [options.terminate] - defaults to killProcessTree.
    * @param {(pid: number) => boolean} [options.isProcessAlive] - defaults to ServerManager._isProcessAlive.
+   * @param {(pid: number, atMs: number) => boolean|null} [options.verify] - process-identity
+   *   re-check before each kill (see _processCreatedBeforeMs): false skips the
+   *   kill (recycled pid), null keeps legacy behavior; defaults to the real check.
+   * @param {({pid: number, atMs: number}) => void} [options.onSkip] - diagnostics
+   *   callback for skipped (recycled-pid) kills.
    * @param {number|null} [options.currentVscodePid] - this window's extension-host pid.
    * @returns {Promise<Array<{pid: number, port: number|undefined, vscodePid: number}>>} swept entries.
    */
-  static async sweepDeadOwnerEntries(registryFile, { terminate = null, isProcessAlive = null, currentVscodePid = null } = {}) {
+  static async sweepDeadOwnerEntries(registryFile, { terminate = null, isProcessAlive = null, verify = null, onSkip = null, currentVscodePid = null } = {}) {
     const kill = typeof terminate === 'function' ? terminate : (pid) => killProcessTree(pid);
     const alive = typeof isProcessAlive === 'function' ? isProcessAlive : (pid) => ServerManager._isProcessAlive(pid);
 
@@ -2134,7 +2322,7 @@ class ServerManager {
             continue;
           }
         }
-        swept.push({ pid: entry.pid, port: entry.port, vscodePid: owner });
+        swept.push({ pid: entry.pid, port: entry.port, vscodePid: owner, at: entry.at });
       }
       // Pruned-attacher state is published under the same lock pass; orphaned
       // entries stay in the file until their kills actually ran (pass 2), so
@@ -2145,9 +2333,28 @@ class ServerManager {
       return { keep, swept, attachersPruned };
     });
 
-    // Pass 2 (unlocked): tree-kill the orphaned DSH processes.
+    // Pass 2 (unlocked): tree-kill the orphaned DSH processes. Each kill is
+    // re-verified against the entry's write time first: a live process
+    // created AFTER the entry was written is a recycled pid wearing the dead
+    // entry's number — killing it would terminate some other window's brand
+    // new child (live 2026-09-20: sweep "terminated 13908" followed, seconds
+    // later, by that same window losing its own fresh child, pid 13908,
+    // "exited unexpectedly" with its ready line already on the log).
+    const verifyProcess = typeof verify === 'function' ? verify : ((pid, at) => ServerManager._processCreatedBeforeMs(pid, at));
     for (const sweptEntry of decision.swept) {
+      const identity = verifyProcess(sweptEntry.pid, sweptEntry.at);
+      if (identity === false) {
+        // Reused pid: leave the innocent process alone; the stale entry is
+        // dropped by pass 3, so a later activation re-evaluates from scratch.
+        if (typeof onSkip === 'function') {
+          try { onSkip({ pid: sweptEntry.pid, atMs: sweptEntry.at }); } catch { /* diagnostics only */ }
+        }
+        console.warn(`dsh-vs-sidebar: orphan sweep skipped pid ${sweptEntry.pid} — the process postdates its registry entry (recycled pid)`);
+        continue;
+      }
       try {
+        // identity === true (verified old process) or null (cannot verify on
+        // this system — legacy behavior: trust the entry).
         await kill(sweptEntry.pid);
       } catch {
         // best-effort tree-kill; the record is still dropped below

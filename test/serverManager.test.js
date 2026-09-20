@@ -8,6 +8,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { EventEmitter } = require('node:events');
 
 const {
   ServerManager,
@@ -621,10 +622,11 @@ test('sweepDeadOwnerEntries tree-kills only entries whose owner pid is dead', as
   const swept = await ServerManager.sweepDeadOwnerEntries(file, {
     terminate: async (pid) => { terminated.push(pid); },
     isProcessAlive: (pid) => pid === 9002 || pid === 9003 || pid === 9004,
+    verify: () => null, // hermetic: skip the real process-identity check
     currentVscodePid: null,
   });
 
-  assert.deepStrictEqual(swept, [{ pid: 5001, port: 4010, vscodePid: 9001 }]);
+  assert.deepStrictEqual(swept, [{ pid: 5001, port: 4010, vscodePid: 9001, at: 1 }]);
   assert.deepStrictEqual(terminated, [5001], 'only the dead-owner child is tree-killed');
   const remaining = JSON.parse(fs.readFileSync(file, 'utf8')).map((entry) => entry.pid);
   assert.deepStrictEqual(remaining, [5002, 5003, '5004'], 'live-owner and legacy entries survive');
@@ -642,6 +644,7 @@ test('sweepDeadOwnerEntries never sweeps entries owned by the current window', a
   const swept = await ServerManager.sweepDeadOwnerEntries(file, {
     terminate: async (pid) => { terminated.push(pid); },
     isProcessAlive: () => false, // even if every owner looks dead…
+    verify: () => null, // hermetic: skip the real process-identity check
     currentVscodePid: 8800,
   });
 
@@ -649,6 +652,73 @@ test('sweepDeadOwnerEntries never sweeps entries owned by the current window', a
   assert.deepStrictEqual(terminated, [6001]);
   const remaining = JSON.parse(fs.readFileSync(file, 'utf8')).map((entry) => entry.pid);
   assert.deepStrictEqual(remaining, [6002]);
+});
+
+test('sweepDeadOwnerEntries skips a recycled pid whose process postdates its entry', async (t) => {
+  const file = path.join(os.tmpdir(), `dsh-sweep-reuse-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  const now = Date.now();
+  // The dead window's dsh was pid 6100. Windows since recycled that pid: the
+  // live process behind pid 6100 was created AFTER the entry was written.
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: 6100, port: 4040, host: '127.0.0.1', vscodePid: 999001, at: now - 60000 },
+  ], null, 2));
+  const terminated = [];
+
+  const swept = await ServerManager.sweepDeadOwnerEntries(file, {
+    terminate: async (pid) => { terminated.push(pid); },
+    isProcessAlive: () => false, // every OWNER looks dead…
+    // pid 6100 was born 1s ago; its entry was written 60s ago, so the live
+    // process postdates the entry: _processCreatedBeforeMs must answer false.
+    verify: (pid, atMs) => (pid === 6100 ? (now - 1000) < atMs : null),
+    currentVscodePid: null,
+  });
+
+  assert.deepStrictEqual(swept.map((entry) => entry.pid), [6100],
+    'the stale entry is still reported as swept');
+  assert.deepStrictEqual(terminated, [],
+    'the recycled pid must NEVER be tree-killed — it belongs to a new process');
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')), [],
+    'the stale entry itself is still dropped');
+});
+
+test('spawn readiness: an explicit short readyTimeoutMs fails HEALTH_TIMEOUT fast', async (t) => {
+  const freePort = await new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+  const neverReadyChild = new EventEmitter();
+  neverReadyChild.pid = 424242;
+  neverReadyChild.kill = () => {};
+  neverReadyChild.exitCode = null;
+  neverReadyChild.signalCode = null;
+  const manager = new ServerManager({ spawnFn: () => neverReadyChild });
+  const fakeRuntime = path.join(os.tmpdir(), `dsh-budget-runtime-${process.pid}${process.platform === 'win32' ? '.exe' : ''}`);
+  fs.writeFileSync(fakeRuntime, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  manager.setResolvedRuntime({
+    executablePath: fakeRuntime,
+    dshHome: os.tmpdir(),
+    profileHome: path.join(os.tmpdir(), 'profiles', 'web'),
+  });
+  manager._killChild = async () => {};
+  const registryFile = path.join(os.tmpdir(), `dsh-budget-${process.pid}-${Date.now()}.json`);
+  t.after(() => {
+    fs.rmSync(registryFile, { force: true });
+    fs.rmSync(`${registryFile}.lock`, { force: true });
+  });
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    manager._spawnAndWait('127.0.0.1', freePort, null, registryFile, manager._cancelGeneration, { readyTimeoutMs: 400 }),
+    (err) => err.code === 'HEALTH_TIMEOUT',
+    'the readiness deadline must surface HEALTH_TIMEOUT'
+  );
+  assert.ok(Date.now() - startedAt < 8000, `a 400ms budget must not wait the full cold budget (took ${Date.now() - startedAt}ms)`);
+  assert.strictEqual(manager.hasOwnedChild(), false, 'the hung child is detached after the deadline kill');
 });
 
 test('ready registry entries carry the C1 owner identity (vscodePid + windowId)', (t) => {
@@ -1002,6 +1072,7 @@ test('sweepDeadOwnerEntries keeps a dead-owner instance alive while attachers li
   const swept = await ServerManager.sweepDeadOwnerEntries(file, {
     terminate: async (pid) => { terminated.push(pid); },
     isProcessAlive: (pid) => pid === 8002,
+    verify: () => null, // hermetic: skip the real process-identity check
     currentVscodePid: null,
   });
 
@@ -1016,6 +1087,7 @@ test('sweepDeadOwnerEntries keeps a dead-owner instance alive while attachers li
   const sweptLater = await ServerManager.sweepDeadOwnerEntries(file, {
     terminate: async (pid) => { terminated.push(pid); },
     isProcessAlive: () => false,
+    verify: () => null, // hermetic: skip the real process-identity check
     currentVscodePid: null,
   });
   assert.deepStrictEqual(sweptLater.map((entry) => entry.pid), [7001]);

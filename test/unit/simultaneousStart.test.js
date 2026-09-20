@@ -98,7 +98,8 @@ function exitingChild(exitCode = 1) {
 
 function newLoserManager({ registryFile }) {
   // A plain regular executable file (assertLaunchableRuntime rejects symlinks).
-  const fakeRuntime = path.join(os.tmpdir(), `dsh-simultaneous-runtime-${process.pid}`);
+  // Windows additionally requires the .exe suffix (native entrypoint check).
+  const fakeRuntime = path.join(os.tmpdir(), `dsh-simultaneous-runtime-${process.pid}${process.platform === 'win32' ? '.exe' : ''}`);
   fs.writeFileSync(fakeRuntime, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   const manager = new ServerManager({ spawnFn: () => exitingChild(1) });
   manager.setResolvedRuntime({
@@ -162,6 +163,58 @@ test('simultaneous start: a genuine spawn failure with no sibling still fails fa
     );
     const elapsed = Date.now() - startedAt;
     assert.ok(elapsed < 8000, `the no-sibling path must fail fast, took ${elapsed}ms`);
+  } finally {
+    fs.rmSync(registryFile, { force: true });
+    fs.rmSync(`${registryFile}.lock`, { force: true });
+  }
+});
+
+test('simultaneous start: a slow-booting loser adopts the winner mid-wait and abandons its duplicate', async () => {
+  const port = await findFreePort();
+  const registryFile = tempRegistryFile('midwait');
+  fs.writeFileSync(registryFile, '[]\n');
+  try {
+    // The loser's own child boots normally (stays alive, never becomes ready
+    // within the test) — the pure "must die of EADDRINUSE" shape of the race
+    // above is only half the story. Under a cold multi-window start every
+    // window spawns a SLOW boot; the winner becomes adoptable while the
+    // losers' children are still loading, and the losers must attach the
+    // moment it is adoptable instead of idling out their readiness budget on
+    // a child that is doomed to lose the port race anyway.
+    const winner = startBootingFakedDsh({ port, bindDelayMs: 600, tokenDelayMs: 1200, registryFile });
+    const fakeRuntime = path.join(os.tmpdir(), `dsh-midwait-runtime-${process.pid}${process.platform === 'win32' ? '.exe' : ''}`);
+    fs.writeFileSync(fakeRuntime, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const manager = new ServerManager({ spawnFn: () => {
+      const child = new EventEmitter();
+      child.pid = 424242; // stays alive: never emits 'exit'
+      child.kill = () => {};
+      child.exitCode = null;
+      child.signalCode = null;
+      return child;
+    } });
+    manager.setResolvedRuntime({
+      executablePath: fakeRuntime,
+      dshHome: os.tmpdir(),
+      profileHome: path.join(os.tmpdir(), 'profiles', 'web'),
+    });
+    manager.setOwnerIdentity({ vscodePid: process.pid, windowId: 'w-loser' });
+    manager._killChild = async () => {}; // hermetic: never taskkill in tests
+
+    const handle = await manager.ensureServer({
+      host: '127.0.0.1',
+      port,
+      autoStart: true,
+      cwd: null,
+      registryFile,
+      shareMode: 'environment',
+      discoverDshWebPorts: async () => [],
+    });
+
+    assert.ok(handle, 'the loser must end up attached to the winner');
+    assert.equal(handle.owned, false, 'the adopted handle is not owned by this window');
+    assert.equal(handle.port, port, 'adoption lands on the configured port');
+    assert.equal(manager.hasOwnedChild(), false, 'the duplicate boot is abandoned before its budget expires');
+    await winner.close();
   } finally {
     fs.rmSync(registryFile, { force: true });
     fs.rmSync(`${registryFile}.lock`, { force: true });

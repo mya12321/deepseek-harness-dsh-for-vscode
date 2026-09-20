@@ -646,6 +646,10 @@ async function sweepOrphansBeforeL0() {
     || ((file, options) => ServerManager.sweepDeadOwnerEntries(file, options));
   const swept = await sweep(hostContext.registryFilePath(), {
     terminate: killProcessTree,
+    onSkip: ({ pid }) => appendDiagnostic(loc(
+      "Orphan sweep skipped pid {pid}: the live process postdates its registry entry (recycled pid) — not terminated.",
+      { pid: String(pid) }
+    )),
     currentVscodePid: process.pid,
   });
   if (Array.isArray(swept) && swept.length > 0) {
