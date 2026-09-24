@@ -1,7 +1,7 @@
 # Known Issues / 问题记录
 
-> 更新日期：2026-09-20 · 对应版本：**1.2.0（开发中）** · 当前**0 个未修复已知问题**
-> Updated 2026-09-20 · tracks in-development **1.2.0** · **0 open issues**
+> 更新日期：2026-09-24 · 对应版本：**1.2.0（开发中）** · 当前**0 个未修复已知问题**
+> Updated 2026-09-24 · tracks in-development **1.2.0** · **0 open issues**
 
 迁移说明：1.2.0 已把扩展迁移到 typert 线上协议，并要求 dsh ≥ 0.1.5-rc.2——斜杠式 JSON-RPC + `/api/remote.mux` WebSocket，旧式 `session.list` / `workspace.list` / `events.mux` / `session.export` 端点全部移除、无降级（见 [CHANGELOG.md](CHANGELOG.md)）。`session/prompt` 请求 id 改为客户端生成；会话回填改走 follow 快照的 `records`。
 Migration note: 1.2.0 hardcodes the typert wire protocol and requires dsh ≥ 0.1.5-rc.2 — slashed JSON-RPC plus `/api/remote.mux` WebSocket; the legacy `session.list` / `workspace.list` / `events.mux` / `session.export` endpoints are gone with no fallback. `session/prompt` request ids are client-minted and the changes-view backfill reads the follow snapshot's `records`.
@@ -26,6 +26,14 @@ Past issues and their fixes (details in the changelog and dev notes):
 | 8 | 桥推送的编辑立即落盘、Accept 仅记账、Undo 反向区间被 applyEdit 拒绝 / bridge-pushed edits wrote to disk immediately, Accept only bookkept, and Undo reverse ranges were rejected | 1.1.2 |
 | 9 | 终端 `read` 始终为空：无 onDidWriteTerminalData 输出回读 / bridge `terminal/read` always returned empty — no terminal output read-back | 1.1.2 |
 | 10 | 插件桥接端点（`/api/lm/*`、`/api/fim`、`/api/vscode/open-link`）在 dsh 0.1.5 上返回 404，LM 路由 / Tab 补全 / 打开链接不可用（根因：路由按**启动时** env 条件挂载，功能后开或收养共享实例时永远挂不上，请求落进 `/api` fetch 桥得到裸 404） / plugin bridge endpoints returned 404 on dsh 0.1.5 — routes were mounted only when their feature env existed at SPAWN time, so later toggles and adopted shared instances never mounted them | 1.2.0 |
+| 11 | 更新 dsh 至 0.1.7 后侧栏 workspace 指向又错了：0.1.7 把会话视图选区从 sessions 控制器搬到 `uiWorkspace` 服务（列表快照无 `current`、`sessions.open` 移除），`dsh_session` 跟随消费方读不到当前会话也发不出切换，60s 预算空转后静默放弃，侧栏停在「最近更新的工作区」 / after updating dsh to 0.1.7 the sidebar's workspace pointing broke again: view selection moved from the sessions controller to the `uiWorkspace` service (no `current` on the list snapshot, `sessions.open` removed), so the dsh_session follow could neither read the current session nor switch, idled out its 60s budget and gave up silently — the sidebar stayed on the most recently updated workspace | 1.2.0（修复未发版，见 CHANGELOG Unreleased）/ 1.2.0 (fix in CHANGELOG Unreleased, unreleased) |
+
+## 验收提示 / Verification notes（dsh 0.1.7 会话视图选区搬家，2026-09-24 修复）
+
+- 实证方式：对运行中的 0.1.7-rc.1 实例（本机 3081）直接核对客户端表面——`@deepseek-ai/dsh-api-session-controller/lib/client.js` 的 `ClientSessions` 方法清单（retain/using/retainInfo/…/create/fork/scope/binding/…）**没有 `open`**，且头注释写明 "view selection remains outside the Controller"；`projectList()` 产出的列表快照是 `{ ids, byId, phase, projectionsBySession }`，**无 `current`**；选区在 `@deepseek-ai/dsh-client-ui-workspace` 的 `uiWorkspace` 服务上（`selection = createSnapshotStore({}, { persist: { name: "dsh.sessions.current" } })`、`openSession(target)` → `replaceMain(target, signal, "reveal")`）。升级前（0.1.5/0.1.6）跟随消费方用的正是旧表面，升级后读/写同时失效，且失败是静默的（预算耗尽即停，页面不报错）。
+  How this was verified: against a live 0.1.7-rc.1 instance (local port 3081) — `ClientSessions` in `@deepseek-ai/dsh-api-session-controller/lib/client.js` has **no `open`** method and its header reads "view selection remains outside the Controller"; `projectList()` emits `{ ids, byId, phase, projectionsBySession }` with **no `current`**; the selection lives on the `uiWorkspace` service in `@deepseek-ai/dsh-client-ui-workspace` (`selection = createSnapshotStore({}, { persist: { name: "dsh.sessions.current" } })`, `openSession(target)` → `replaceMain(target, signal, "reveal")`). The pre-update follow consumer used exactly the removed surfaces, so the update silently broke both its read and write sides (budget expiry stops the loop without any on-page error).
+- 修复后部署：扩展激活时的内容感知同步会把新 client.js 写进 profile 的 `node_modules/dsh-vscode-integration/`（hmr 已被 vscode profile 关闭且这是客户端模块，无需重启 DSH 实例）——重载侧栏 iframe（DSH: Reconnect / 重载窗口）后 boot page 的插件模块 rev 变化即生效；已在 0.1.7-rc.1 实例上实测新 rev 的 client.js 正常下发。
+  Post-fix deployment: the extension's content-aware activation sync writes the new client.js into the profile's `node_modules/dsh-vscode-integration/` (hmr is disabled in the vscode profile and this is a client module, so no DSH instance restart is needed) — reloading the sidebar iframe (DSH: Reconnect / window reload) picks up the new boot-page module rev; verified live on the 0.1.7-rc.1 instance serving the new rev.
 
 ## 验收提示 / Verification notes（插件桥接端点 404，2026-09-19 修复）
 

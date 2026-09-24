@@ -317,16 +317,86 @@ window.__ModuleLoader__.load({
     // no official client consumes the param, so without this bridge the
     // sidebar keeps showing the previous workspace's conversation after the
     // switch. Wait for the target session to appear in the list mirror (the
-    // session list loads asynchronously), then route it through
-    // sessions.open() exactly like a user click on the session row.
+    // session list loads asynchronously), then route it through the app's
+    // session navigation exactly like a user click on the session row
+    // (0.1.7+: uiWorkspace.openSession(); older: sessions.open()).
     // Session-current watcher: a conversation switch performed INSIDE the
     // DSH web UI (session-row click) is invisible to the VS Code shell — the
     // shell only re-renders on its own navigation commands, so the changes
     // tree and the workspace binding kept pointing at the previous session
     // (live bug 2026-09-04: "switching conversations did not switch the
-    // changes view"). Poll the session-list mirror's `current` pointer and
+    // changes view"). Poll the app's current-session pointer (0.1.7:
+    // uiWorkspace.selection; older: the list mirror's `current`) and
     // announce every change to the shell; the shell relays the
     // dshSessionChanged message to the extension host.
+    // dsh 0.1.7 moved view selection OUT of the sessions controller (the
+    // ClientSessions header now reads "view selection remains outside the
+    // Controller"): the session-list snapshot lost its `current` field and
+    // `sessions.open()` is gone — both surfaces moved to the `uiWorkspace`
+    // service (`selection` snapshot store carrying `{ sessionId }` and
+    // `openSession(sessionId)`). Without adapting, the follow loop can no
+    // longer read the app's current session nor switch it, so the embedded
+    // sidebar silently stays on the app's own restore pick — the most
+    // recently updated workspace — which reads as "the plugin's workspace
+    // pointing is wrong" after a dsh update (live bug 2026-09-24).
+    //
+    // `uiWorkspace` is resolved lazily on every read (it may materialize
+    // after apply) and is deliberately NOT declared in module.exports.inject:
+    // a declared-but-missing inject pends forever on pre-0.1.7 runtimes and
+    // the whole bridge would never start (the same failure shape as the
+    // server-side apiProxy inject). The legacy sessions surface stays as the
+    // fallback so runtimes back to 0.1.5 keep working unchanged.
+    function resolveUiWorkspace(ctx) {
+      if (!ctx || typeof ctx.get !== 'function') return null;
+      try {
+        const ui = ctx.get('uiWorkspace');
+        if (ui && typeof ui === 'object') return ui;
+      } catch {
+        // service absent on pre-0.1.7 runtimes: the legacy path owns the read
+      }
+      return null;
+    }
+
+    /** The app's current session id, or null while nothing is selected. */
+    function readCurrentSessionId(ctx, snapshot) {
+      const ui = resolveUiWorkspace(ctx);
+      if (ui && ui.selection && typeof ui.selection.getSnapshot === 'function') {
+        try {
+          const selection = ui.selection.getSnapshot();
+          if (selection && typeof selection.sessionId === 'string' && selection.sessionId.length > 0) {
+            return selection.sessionId;
+          }
+        } catch {
+          // fall through to the legacy snapshot field
+        }
+      }
+      return snapshot && typeof snapshot.current === 'string' ? snapshot.current : null;
+    }
+
+    /** Route a session switch through the 0.1.7+ navigation, then the legacy face. */
+    const OPEN_NO_PATH = 0; // no navigation surface mounted yet — nothing was tried
+    const OPEN_ATTEMPTED = 1; // a surface was called (its throw, if any, waits for the next tick)
+    function openSessionTarget(ctx, target) {
+      const ui = resolveUiWorkspace(ctx);
+      if (ui && typeof ui.openSession === 'function') {
+        try {
+          ui.openSession(target);
+        } catch {
+          // the next tick retries (throttled by the open budget)
+        }
+        return OPEN_ATTEMPTED;
+      }
+      if (ctx && ctx.sessions && typeof ctx.sessions.open === 'function') {
+        try {
+          ctx.sessions.open(target);
+        } catch {
+          // the next tick retries
+        }
+        return OPEN_ATTEMPTED;
+      }
+      return OPEN_NO_PATH;
+    }
+
     function startSessionCurrentWatcher(ctx) {
       if (!ctx.sessions || !ctx.sessions.list || typeof ctx.sessions.list.getSnapshot !== 'function') {
         return () => {};
@@ -338,7 +408,7 @@ window.__ModuleLoader__.load({
         if (disposed) return;
         try {
           const snapshot = ctx.sessions.list.getSnapshot();
-          const current = snapshot && typeof snapshot.current === 'string' ? snapshot.current : null;
+          const current = readCurrentSessionId(ctx, snapshot);
           if (last === null) {
             last = current; // baseline: never announce the boot-time session
           } else if (current !== last) {
@@ -412,7 +482,7 @@ window.__ModuleLoader__.load({
         const snapshot = snapshotNow();
         let done = false;
         if (snapshot) {
-          const current = typeof snapshot.current === 'string' ? snapshot.current : null;
+          const current = readCurrentSessionId(ctx, snapshot);
           // A 'loading' snapshot still carries the PREVIOUS list, so neither
           // the baseline nor a stand-down decision may be read from it.
           const loaded = snapshot.phase === undefined || snapshot.phase !== 'loading';
@@ -428,8 +498,7 @@ window.__ModuleLoader__.load({
           }
           if (current === target) {
             done = true; // followed — or the user picked it themselves
-          } else if (ctx.sessions && typeof ctx.sessions.open === 'function'
-            && snapshot.byId && snapshot.byId[target] !== undefined) {
+          } else if (snapshot.byId && snapshot.byId[target] !== undefined) {
             // Someone other than the restore-point chose a session: that is
             // the user clicking a row (or the app moving on), and the follow
             // must stand down instead of yanking the view back. 'Not yet in
@@ -437,14 +506,14 @@ window.__ModuleLoader__.load({
             if (loaded && baselineSeen && current !== baseline) {
               done = true;
             } else if (opens < followLimits.maxOpens
-              && Date.now() - lastOpenAt >= followLimits.openIntervalMs) {
+              && Date.now() - lastOpenAt >= followLimits.openIntervalMs
+              && openSessionTarget(ctx, target) === OPEN_ATTEMPTED) {
+              // Only a real navigation attempt consumes the open budget: on
+              // 0.1.7+ the uiWorkspace service can mount after apply, and
+              // burning the budget on ticks with no navigation surface yet
+              // would strand the follow with its work never even tried.
               opens += 1;
               lastOpenAt = Date.now();
-              try {
-                ctx.sessions.open(target); // select() can race a list refresh
-              } catch {
-                // the next tick retries
-              }
             }
           }
         }
