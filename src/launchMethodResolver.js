@@ -20,6 +20,23 @@ function firstLine(output) {
   return String(output || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] || null;
 }
 
+/** Shim extensions npm/pnpm/yarn write on Windows. */
+const SHIM_SUFFIXES = ['.cmd', '.bat', '.ps1'];
+
+/**
+ * Whether a Windows PATH hit is a shim whose content we can parse. Besides
+ * the .cmd/.bat/.ps1 trio, pnpm writes an EXTENSIONLESS POSIX `sh` shim
+ * alongside them — and that one is what `where.exe dsh` returns first, so
+ * rejecting it outright stranded every pnpm-global install. Accepting it is
+ * safe: the caller parses read-only and verifies the recovered root against
+ * package.json, so a non-shim file simply fails verification.
+ */
+function isParseableShim(hit) {
+  const lower = String(hit).toLowerCase();
+  if (SHIM_SUFFIXES.some((suffix) => lower.endsWith(suffix))) return true;
+  return path.win32.extname(lower) === '';
+}
+
 /**
  * Resolve the first PATH hit for a command name using the platform's lookup
  * utility ('where.exe' on Windows, 'which' elsewhere). Never spawns the
@@ -109,7 +126,7 @@ async function resolveCommandRuntime({
       }),
     });
   }
-  if (!(lower.endsWith('.cmd') || lower.endsWith('.bat') || lower.endsWith('.ps1'))) {
+  if (!isParseableShim(hit)) {
     return null;
   }
   const roots = await packageRootsFromShim(hit, { readFile: deps.readFile });

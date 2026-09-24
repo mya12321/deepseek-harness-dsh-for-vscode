@@ -81,6 +81,38 @@ test('resolveCommandRuntime parses a Windows shim into node + bin.js (never exec
   assert.deepStrictEqual([...runtime.entrypointArgs], [binJs]);
 });
 
+test('resolveCommandRuntime parses pnpm extensionless sh shim (where.exe returns it first)', async () => {
+  // pnpm's store directory is a content hash, and `where.exe dsh` returns the
+  // extensionless `sh` shim ahead of dsh.cmd — the hit that used to be
+  // rejected outright, stranding every pnpm-global install.
+  const local = 'C:\\Users\\dev\\AppData\\Local\\pnpm';
+  const root = path.win32.join(local, 'global', '5', '.pnpm',
+    '@deepseek-ai+dsh@0.1.7-rc.1_4a0342b4', 'node_modules', '@deepseek-ai', 'dsh');
+  const binJs = path.win32.join(root, 'lib', 'bin.js');
+  const shimPath = path.win32.join(local, 'bin', 'dsh');
+  const runtime = await resolveCommandRuntime({
+    command: 'dsh',
+    dshHome: 'C:\\dsh-home',
+    platform: 'win32',
+    env: { Path: 'C:\\Users\\dev\\AppData\\Local\\pnpm\\bin;C:\\Program Files\\nodejs' },
+    deps: {
+      execFn: async () => shimPath,
+      readFile: async (p) => (path.win32.basename(p) === 'package.json'
+        ? JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.1.7-rc.1', bin: { dsh: 'lib/bin.js' } })
+        : 'exec node  "$basedir/../global/5/.pnpm/@deepseek-ai+dsh@0.1.7-rc.1_4a0342b4'
+          + '/node_modules/@deepseek-ai/dsh/lib/bin.js" "$@"'),
+      stat: async (p) => {
+        if (typeof p === 'string' && (p === binJs || /node\.exe$/i.test(p))) return fileStat;
+        return Promise.reject(new Error('ENOENT'));
+      },
+    },
+  });
+  assert.strictEqual(runtime.source, 'command-shim');
+  assert.strictEqual(runtime.dshVersion, '0.1.7-rc.1');
+  assert.ok(/node\.exe$/i.test(runtime.executablePath), 'launches node.exe, never the sh shim');
+  assert.deepStrictEqual([...runtime.entrypointArgs], [binJs]);
+});
+
 test('resolveCommandRuntime returns null when nothing resolves', async () => {
   const none = await resolveCommandRuntime({
     command: 'dsh',

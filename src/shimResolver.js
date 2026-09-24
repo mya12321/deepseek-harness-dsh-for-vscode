@@ -18,13 +18,24 @@ const path = require('node:path');
  * @module shimResolver
  */
 
-const SHIM_BASENAMES = ['dsh.cmd', 'dsh.ps1'];
+// pnpm additionally writes an extensionless POSIX `sh` shim next to the
+// .cmd/.ps1 pair, and `where.exe dsh` returns that one first.
+const SHIM_BASENAMES = ['dsh.cmd', 'dsh.ps1', 'dsh'];
 
 /**
- * Extract raw entrypoint tokens from npm/pnpm/yarn shim content.
- * Handles both %~dp0%-relative (npm) and absolute (pnpm) references.
+ * Extract raw entrypoint tokens from npm/pnpm/yarn shim content. Four
+ * reference shapes are recovered, because the shim writers disagree:
+ *
+ *  - absolute drive paths (npm on some setups, cmd-shim's trailing
+ *    `# cmd-shim-target=<abs>` marker)
+ *  - `%~dp0%`-relative (npm: `SET dp0=%~dp0` then `"%dp0%\...\bin.js"`)
+ *  - `%~dp0`-relative (pnpm: `"%~dp0\..\global\v11\<hash>\...\bin.js"` — note
+ *    the MISSING closing `%`, which the original `%~dp0%` pattern rejected)
+ *  - `$basedir`-relative with forward slashes (pnpm's .ps1 and `sh` shims:
+ *    `"$basedir/../global/v11/<hash>/.../bin.js"`)
+ *
  * @param {string} content
- * @returns {string[]} raw path tokens (may need %~dp0% expansion)
+ * @returns {string[]} raw path tokens (may need shimDir expansion)
  */
 function extractShimEntrypoints(content) {
   if (typeof content !== 'string' || content.length === 0) return [];
@@ -32,22 +43,28 @@ function extractShimEntrypoints(content) {
   // absolute-drive references: C:\...\@deepseek-ai\dsh\...\*.js (pnpm style)
   const absoluteRe = /[A-Za-z]:[\\/](?:[^\r\n"']*[\\/])?@deepseek-ai[\\/]dsh[\\/][^\r\n"']*\.js/g;
   for (const m of content.match(absoluteRe) || []) tokens.add(m);
-  // %~dp0% / %dp0%-relative references (npm cmd shim style): npm writes
-  // `SET dp0=%~dp0` then quotes the target as "%dp0%\node_modules\...\bin.js",
-  // so BOTH spellings must match (pnpm writes %~dp0% directly).
-  const dpZeroRe = /%[~]?dp0%[^\r\n"']*?@deepseek-ai[\\/]dsh[\\/][^\r\n"']*\.js/gi;
+  // %~dp0% / %~dp0 (and the `SET dp0=%~dp0` spelling), closing `%` OPTIONAL:
+  // npm and cmd-shim write it, pnpm's `%~dp0\..\global\...` does not.
+  const dpZeroRe = /%[~]?dp0%?[^\r\n"']*?@deepseek-ai[\\/]dsh[\\/][^\r\n"']*\.js/gi;
   for (const m of content.match(dpZeroRe) || []) tokens.add(m);
-  // PowerShell shims reference the target with $args / & "...bin.js"
-  const psRe = /[A-Za-z]:[\\/][^\r\n"']*?@deepseek-ai[\\/]dsh[\\/][^\r\n"']*\.js/g;
-  for (const m of content.match(psRe) || []) tokens.add(m);
+  // $basedir-relative references, forward- or back-slashed (pnpm .ps1 + sh).
+  const basedirRe = /\$basedir[\\/][^\r\n"']*?@deepseek-ai[\\/]dsh[\\/][^\r\n"']*\.js/gi;
+  for (const m of content.match(basedirRe) || []) tokens.add(m);
+  // cmd-shim writes the resolved target as a trailing comment marker, which is
+  // already absolute and needs no expansion at all — the most reliable hook.
+  const markerRe = /cmd-shim-target=([^\r\n"';]+?\.js)/gi;
+  for (const m of content.matchAll(markerRe)) tokens.add(m[1].trim());
   return [...tokens];
 }
 
-/** Expand %~dp0% / %dp0% (shim directory) inside a raw token. */
+/** Expand $basedir / %~dp0% / %~dp0 (shim directory) inside a raw token. */
 function expandShimToken(token, shimDir) {
   if (typeof token !== 'string' || token.length === 0) return null;
   const dir = path.win32.resolve(String(shimDir));
-  let expanded = token.replace(/%~dp0%/gi, dir + '\\').replace(/%dp0%/gi, dir + '\\');
+  let expanded = token
+    .replace(/\$basedir/gi, dir)
+    .replace(/%~dp0%?/gi, dir + '\\')
+    .replace(/%dp0%?/gi, dir + '\\');
   expanded = expanded.replace(/^"|"$/g, '').trim();
   if (!path.win32.isAbsolute(expanded)) return null;
   return path.win32.normalize(expanded);
@@ -163,6 +180,53 @@ function windowsGlobalLayoutCandidates(env, { readdir } = {}) {
 }
 
 /**
+ * Enumerate the pnpm global store. pnpm nests the real package under a
+ * content-addressed directory whose name changes on EVERY install, so no
+ * static path guess can be correct:
+ *
+ *   %LOCALAPPDATA%\pnpm\global\<hash>\node_modules\@deepseek-ai\dsh      (old)
+ *   %LOCALAPPDATA%\pnpm\global\<major>\<hash>\node_modules\@deepseek-ai\dsh (v10+)
+ *
+ * The `global\5\...` guess in windowsGlobalLayoutCandidates only ever covered
+ * pnpm's pre-v6 numbering; reading the directory listing covers every scheme.
+ * Read-only and best-effort: an unreadable or absent store yields no roots.
+ *
+ * @param {object} env
+ * @param {{ readdir?: Function }} [deps]
+ * @returns {Promise<string[]>}
+ */
+async function pnpmGlobalPackageRoots(env, deps = {}) {
+  const readdir = deps.readdir || ((p) => fs.promises.readdir(p, { withFileTypes: true }));
+  const local = env.LOCALAPPDATA;
+  if (!local) return [];
+  const globalDir = path.win32.join(local, 'pnpm', 'global');
+  const pkgTail = ['node_modules', '@deepseek-ai', 'dsh'];
+  const roots = [];
+  let groups;
+  try {
+    groups = await readdir(globalDir);
+  } catch {
+    return [];
+  }
+  for (const group of groups) {
+    if (!group || !group.isDirectory()) continue;
+    const groupDir = path.win32.join(globalDir, group.name);
+    roots.push(path.win32.join(groupDir, ...pkgTail));
+    let nested;
+    try {
+      nested = await readdir(groupDir);
+    } catch {
+      continue;
+    }
+    for (const inner of nested) {
+      if (!inner || !inner.isDirectory()) continue;
+      roots.push(path.win32.join(groupDir, inner.name, ...pkgTail));
+    }
+  }
+  return roots;
+}
+
+/**
  * Normalize the user-facing dsh.executablePath setting into package roots.
  * Accepted inputs: the package directory itself, the lib/bin.js entrypoint,
  * or a Windows shim (dsh.cmd / dsh.ps1 / dsh.bat) whose content embeds the
@@ -206,6 +270,7 @@ module.exports = {
   packageRootsFromShim,
   executableSettingPackageRoots,
   shimDiscoveredPackageRoots,
+  pnpmGlobalPackageRoots,
   windowsPathPackageCandidates,
   windowsGlobalLayoutCandidates,
 };

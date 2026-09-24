@@ -9,6 +9,7 @@ const { STARTUP_ERRORS } = require('./startupErrors');
 const {
   executableSettingPackageRoots,
   shimDiscoveredPackageRoots,
+  pnpmGlobalPackageRoots,
   windowsPathPackageCandidates,
   windowsGlobalLayoutCandidates,
 } = require('./shimResolver');
@@ -301,12 +302,16 @@ async function resolveLocalDshRuntime({
     }
     explicitRoots.push(...normalized.packageRoots);
   }
-  const shimRoots = explicitRoots.length === 0 && platform === 'win32'
-    ? await shimDiscoveredPackageRoots(env)
+  // Discovery order on win32: parsed shims (authoritative — they embed the
+  // real entrypoint), then the enumerated pnpm global store (its directory
+  // names are content hashes, so only a listing can find them), then the
+  // static layout guesses.
+  const discoveredRoots = explicitRoots.length === 0 && platform === 'win32'
+    ? [...await shimDiscoveredPackageRoots(env), ...await pnpmGlobalPackageRoots(env)]
     : [];
   const roots = explicitRoots.length > 0
     ? explicitRoots
-    : [...shimRoots, ...packageCandidates(env, platform)];
+    : [...discoveredRoots, ...packageCandidates(env, platform)];
   let resolvedPackageRoot = null;
   let packageJson = null;
   for (const candidate of roots) {

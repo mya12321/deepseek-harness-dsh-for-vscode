@@ -168,6 +168,72 @@ test('local resolver discovers a Volta-managed package on win32', async (t) => {
   assert.strictEqual(runtime.executablePath, fs.realpathSync(path.join(versionRoot, 'bin', 'node.exe')));
 });
 
+// Regression: a pnpm-global install used to report "Official DSH is not
+// installed". pnpm's store path is a content hash (no static guess can hit
+// it) and its Windows shims reference `%~dp0\..` with NO closing `%`, which
+// the original `%~dp0%` pattern rejected — so every discovery layer missed.
+// The win32 layers join with path.win32, so these need a win32 host fs.
+const PNPM_STORE_TAIL = ['global', '5', '.pnpm', '@deepseek-ai+dsh@0.1.7-rc.1_4a0342b4',
+  'node_modules', '@deepseek-ai', 'dsh'];
+for (const [label, shimName, shimContent] of [
+  ['%~dp0 dsh.cmd shim', 'dsh.cmd', (rel) => 'node  "%~dp0' + rel + '" %*'],
+  ['$basedir extensionless sh shim', 'dsh', (rel) => 'exec node  "$basedir/' + rel.replace(/\\/g, '/') + '" "$@"'],
+]) {
+  test('local resolver finds a pnpm-global install via its ' + label, { skip: process.platform !== 'win32' }, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-pnpm-win-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const localAppData = path.join(root, 'LocalAppData');
+    const binDir = path.join(localAppData, 'pnpm', 'bin');
+    const storeDir = path.join(localAppData, 'pnpm', ...PNPM_STORE_TAIL);
+    writeOfficialPackage(storeDir);
+    const nodeDir = path.join(root, 'nodejs');
+    writeNodeExecutable(nodeDir, 'node.exe');
+    fs.mkdirSync(binDir, { recursive: true });
+    const rel = ['..', ...PNPM_STORE_TAIL, 'lib', 'bin.js'].join('\\');
+    fs.writeFileSync(path.join(binDir, shimName), shimContent(rel));
+
+    const runtime = await resolveLocalDshRuntime({
+      dshHome: path.join(root, 'storage', '.dsh'),
+      env: { LOCALAPPDATA: localAppData, Path: [binDir, nodeDir].join(';') },
+      platform: 'win32',
+    });
+
+    assert.strictEqual(runtime.source, 'local-official-package');
+    assert.strictEqual(runtime.dshVersion, '0.1.0-rc.6');
+    assert.deepStrictEqual(
+      runtime.entrypointArgs,
+      [fs.realpathSync(path.join(storeDir, 'lib', 'bin.js'))]
+    );
+    assert.strictEqual(runtime.executablePath, fs.realpathSync(path.join(nodeDir, 'node.exe')));
+  });
+}
+
+test('local resolver finds a pnpm-global install with NO shim on PATH', { skip: process.platform !== 'win32' }, async (t) => {
+  // pnpm 10+ keeps the package under global/<major>/<hash>/node_modules; the
+  // shim may be absent from VS Code's PATH entirely, so the enumerated store
+  // is the only layer that can find it.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-pnpm-noshim-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const localAppData = path.join(root, 'LocalAppData');
+  const storeDir = path.join(localAppData, 'pnpm', 'global', 'v11', 'c7c8447f',
+    'node_modules', '@deepseek-ai', 'dsh');
+  writeOfficialPackage(storeDir);
+  const nodeDir = path.join(root, 'nodejs');
+  writeNodeExecutable(nodeDir, 'node.exe');
+
+  const runtime = await resolveLocalDshRuntime({
+    dshHome: path.join(root, 'storage', '.dsh'),
+    env: { LOCALAPPDATA: localAppData, Path: nodeDir },
+    platform: 'win32',
+  });
+
+  assert.strictEqual(runtime.dshVersion, '0.1.0-rc.6');
+  assert.deepStrictEqual(
+    runtime.entrypointArgs,
+    [fs.realpathSync(path.join(storeDir, 'lib', 'bin.js'))]
+  );
+});
+
 test('local resolver discovers an fnm-windows-managed package on win32', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-fnm-win-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
