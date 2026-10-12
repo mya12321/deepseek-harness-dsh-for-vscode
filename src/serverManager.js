@@ -18,6 +18,10 @@
  *     adoption retry to settle a simultaneous-start race.
  *   - keep a JSON instance registry for stale-entry cleanup and diagnostics;
  *     live entries from other VS Code windows are never adopted by default.
+ *     Every entry records the OS environment its instance RUNS in, and an
+ *     instance of the other environment is refused outright: a Windows-hosted
+ *     DSH sees only Windows paths, so a WSL window adopting it fails every
+ *     workspace with `workspace/invalid-path` (see _adoptionFacts).
  *     In shared mode the registry additionally records which windows
  *     (attachers) adopted an instance so the spawning window's exit path can
  *     leave it running for the remaining windows, and the activation sweep
@@ -40,7 +44,12 @@ const {
 } = require('./managedRuntimeLaunch');
 const { STARTUP_ERRORS } = require('./startupErrors');
 const { tokenFromUrl } = require('./dshWebAuth');
-const { SHARE_MODES } = require('./runtimeEnvironment');
+const {
+  SHARE_MODES,
+  detectProcessEnvironment,
+  detectRuntimeEnvironment,
+  hostEnvironmentLabel,
+} = require('./runtimeEnvironment');
 
 // Shared contract constants normally come from ./types. Fall back to local
 // defaults so this file stays independently testable when copied in isolation.
@@ -405,6 +414,12 @@ class ServerManager {
     // zero mis-kill) without ever touching a live owner.
     this.ownerVscodePid = null; // extension-host process pid (process.pid)
     this.ownerWindowId = null;  // stable window identity (see extension.js deriveWindowId)
+    // Which OS environment (windows/wsl/linux/other) this window IS. Stamped
+    // onto every ready registry entry as `runtimeEnvironment` and used to
+    // refuse adopting an instance of the other environment (see
+    // _adoptionFacts); the extension feeds the same value it resolved its
+    // runtime with, so both sides of the split agree.
+    this.hostEnvironment = detectRuntimeEnvironment().id;
     this._selfHealCount = 0; // successful patch-drop self-heal retries for Diagnose
     this._child = null;   // ChildProcess spawned by THIS instance (owned)
     this._noOpenSuppressed = false; // session-sticky: runtime rejected --no-open
@@ -473,12 +488,21 @@ class ServerManager {
    * The owner is the extension host process (vscodePid = process.pid) plus a
    * stable window id. Entries without a numeric owner stay legacy-compatible
    * and are left untouched by the activation sweep.
-   * @param {{vscodePid?: number|null, windowId?: string|null}} identity
+   *
+   * `environment` (the extension's own detectRuntimeEnvironment().id) is
+   * optional: when omitted the constructor's detection stands. It is a
+   * separate parameter rather than derived here because the extension already
+   * resolved it for the runtime — one window, one answer.
+   *
+   * @param {{vscodePid?: number|null, windowId?: string|null, environment?: string|null}} identity
    * @returns {{vscodePid: number|null, windowId: string|null}} the normalized identity.
    */
-  setOwnerIdentity({ vscodePid = null, windowId = null } = {}) {
+  setOwnerIdentity({ vscodePid = null, windowId = null, environment = null } = {}) {
     this.ownerVscodePid = Number.isInteger(vscodePid) ? vscodePid : null;
     this.ownerWindowId = typeof windowId === 'string' && windowId.length > 0 ? windowId : null;
+    if (typeof environment === 'string' && environment.length > 0) {
+      this.hostEnvironment = environment;
+    }
     return { vscodePid: this.ownerVscodePid, windowId: this.ownerWindowId };
   }
 
@@ -674,6 +698,17 @@ class ServerManager {
     const deadline = Date.now() + Math.max(0, settleMs);
     for (let round = 0; ; round++) {
       try {
+        // Refuse an instance of the other OS environment before probing it at
+        // all, and re-check on every round: a pre-fix sibling window can write
+        // its (foreign) entry while this window is still settling, so this must
+        // not be a one-shot decision made before that entry existed. Returning
+        // immediately also keeps the settle budget from being spent on an
+        // instance this window can never use.
+        const facts = ServerManager._adoptionFacts(registryFile, host, port, this.hostEnvironment);
+        if (facts.foreign) {
+          this._refuseForeignAdoption(facts.entry, registryFile);
+          return null;
+        }
         // Emit the probing stage only once: the settle loop may run for
         // seconds and re-rendering the status page every round is churn.
         if (round === 0 && !silent) {
@@ -684,7 +719,7 @@ class ServerManager {
         if (result && result.reachable && !result.isDsh) {
           // Reachable but not recognized: on dsh 0.1.2+ this is the auth fence
           // answering 401. Retry with the owning window's launch token.
-          token = ServerManager._launchTokenFromRegistry(registryFile, host, port);
+          token = ServerManager._entryLaunchToken(facts.entry);
           if (token) {
             const withToken = await this.probeWithRetry(host, port, { token });
             if (withToken && withToken.reachable && withToken.isDsh) result = withToken;
@@ -694,7 +729,7 @@ class ServerManager {
         if (result && result.reachable && result.isDsh) {
           this._emit('reusing', 'Found a running DSH instance at http://{host}:{port}, reusing', { host, port });
           this._startHealthWatch(host, port, token);
-          const managedEntry = ServerManager._managedEntryFromRegistry(registryFile, host, port);
+          const managedEntry = facts.entry;
           const handle = this._reuseHandle(host, port, token, managedEntry
             ? {
               pid: managedEntry.pid,
@@ -741,6 +776,99 @@ class ServerManager {
   }
 
   /**
+   * Registry facts about the live instance on host:port — the entry together
+   * with whether that instance belongs to the OTHER OS environment.
+   *
+   * A foreign instance must never be adopted: it sees only the other OS's
+   * paths, so every workspace this window binds fails with
+   * `workspace/invalid-path` and the sidebar cannot create a session at all
+   * (the live WSL failure this gate exists for). Entries written before the
+   * `runtimeEnvironment` stamp carry no field, so the process itself is asked
+   * — WSL interop is visible in /proc — and an `unknown` verdict is never
+   * treated as foreign, which keeps adoption untouched on every platform this
+   * side cannot inspect and for every genuinely native process.
+   *
+   * @param {string|null} registryFile - Instance registry path.
+   * @param {string} host - DSH endpoint host.
+   * @param {number} port - DSH endpoint port.
+   * @param {string} [hostEnvironment] - This window's environment id; defaults
+   *   to this host's own detection.
+   * @param {{detectProcessEnvironment?: Function}} [deps] - Test seam for the
+   *   process observation of pre-stamp entries.
+   * @returns {{entry: object|null, foreign: boolean}}
+   */
+  static _adoptionFacts(registryFile, host, port, hostEnvironment = detectRuntimeEnvironment().id, deps = {}) {
+    const entry = ServerManager._managedEntryFromRegistry(registryFile, host, port);
+    if (!entry) return { entry: null, foreign: false };
+    const observe = typeof deps.detectProcessEnvironment === 'function'
+      ? deps.detectProcessEnvironment
+      : detectProcessEnvironment;
+    const declared = typeof entry.runtimeEnvironment === 'string' && entry.runtimeEnvironment.length > 0
+      ? entry.runtimeEnvironment
+      : observe(entry.pid);
+    return { entry, foreign: declared !== 'unknown' && declared !== hostEnvironment };
+  }
+
+  /**
+   * Handle a live instance that belongs to the other OS environment.
+   *
+   * When that entry is owned by THIS very window — a spawn from before this
+   * gate existed, or a stale entry whose runtime was replaced — nothing else
+   * would ever clean it up: the activation sweep deliberately leaves
+   * current-window entries alone. So it is stopped and its entry dropped, and
+   * the caller goes on to start a native instance. An instance owned by a
+   * SIBLING window is left running — stopping another live window's server is
+   * not this window's call — and this window merely refuses to adopt it.
+   *
+   * The kill is best-effort by nature: on WSL the signal reaches the `/init`
+   * interop wrapper and whether the Windows-side process follows cannot be
+   * verified from here. Nothing downstream depends on it succeeding — a
+   * surviving instance is simply refused again on the next pass.
+   *
+   * @param {object|null} entry - Live registry entry of the foreign instance.
+   * @param {string|null} registryFile - Instance registry path.
+   * @returns {boolean} True when this window owned (and tried to stop) it.
+   */
+  _refuseForeignAdoption(entry, registryFile) {
+    const ownedByThisWindow = this.ownerVscodePid !== null
+      && entry !== null
+      && typeof entry === 'object'
+      && entry.vscodePid === this.ownerVscodePid
+      && Number.isInteger(entry.pid);
+    if (ownedByThisWindow) {
+      killProcessTree(entry.pid).catch(() => {
+        // best-effort: only the interop wrapper is guaranteed to receive it
+      });
+      ServerManager._removeRegistryEntry(registryFile, entry.pid);
+    }
+    this._emit('selfheal', 'The DSH instance at http://{host}:{port} belongs to another OS environment ({environment}); this window will not use it', {
+      host: entry && typeof entry.host === 'string' && entry.host.length > 0 ? entry.host : DEFAULT_HOST,
+      port: entry && Number.isInteger(entry.port) ? entry.port : DEFAULT_PORT,
+      environment: hostEnvironmentLabel(),
+    });
+    return ownedByThisWindow;
+  }
+
+  /**
+   * The environment an instance on `pid` runs in, for the registry stamp.
+   * Observed first: a child spawned before the foreign-runtime guard existed
+   * (a WSL window whose PATH held only a `/mnt/c` shim) is a Windows process
+   * whose recorded runtime shape looks native — /proc is the only witness.
+   * Falls back to the resolved runtime's declared environment, then to this
+   * host's own.
+   * @param {number} pid - Process id of the instance.
+   * @returns {string} One of 'windows'|'wsl'|'linux'|'other'.
+   */
+  runtimeEnvironmentFor(pid) {
+    const observed = detectProcessEnvironment(pid);
+    if (observed !== 'unknown') return observed;
+    if (this.resolvedRuntime && typeof this.resolvedRuntime.environment === 'string') {
+      return this.resolvedRuntime.environment;
+    }
+    return this.hostEnvironment;
+  }
+
+  /**
    * Recover the launch token of the DSH instance serving host:port from the
    * instance registry. Two sources, in order:
    *
@@ -757,11 +885,17 @@ class ServerManager {
    */
   static _launchTokenFromRegistry(registryFile, host, port) {
     if (!registryFile) return null;
-    const entries = ServerManager._readRegistryRaw(registryFile);
-    const entry = entries.find((e) => e
-      && e.port === port
-      && (!e.host || e.host === host)
-      && ServerManager._isProcessAlive(e.pid));
+    return ServerManager._entryLaunchToken(
+      ServerManager._managedEntryFromRegistry(registryFile, host, port)
+    );
+  }
+
+  /**
+   * The launch token recorded for one registry entry: `entry.authToken` first,
+   * the spawn log's ready line second (entries written by older versions of
+   * this extension). Null when neither source has one.
+   */
+  static _entryLaunchToken(entry) {
     if (!entry) return null;
     if (typeof entry.authToken === 'string' && entry.authToken.length > 0) return entry.authToken;
     if (typeof entry.log === 'string' && entry.log.length > 0) {
@@ -1036,6 +1170,21 @@ class ServerManager {
     // never adopts another window's child or a manually started service.
     if (!autoStart) {
       if (r.reachable && r.isDsh) {
+        // Environment gate on REGISTRY EVIDENCE only: a `dsh web` the user
+        // started by hand has no entry and stays adoptable — this mode exists
+        // to attach to exactly that — while an entry naming the other OS
+        // environment (or whose process is observably an interop one) is
+        // refused. This path cannot self-heal by spawning a native instance,
+        // so here the refusal IS the error the user sees.
+        const facts = ServerManager._adoptionFacts(registryFile, host, port, this.hostEnvironment);
+        if (facts.foreign) {
+          this._refuseForeignAdoption(facts.entry, registryFile);
+          throw new ServerError(
+            STARTUP_ERRORS.RUNTIME_FOREIGN_INSTANCE.template,
+            { host, port, environment: hostEnvironmentLabel() },
+            'RUNTIME_FOREIGN_INSTANCE'
+          );
+        }
         this._emit('reusing', 'Found a running DSH instance at http://{host}:{port}, reusing', { host, port });
         return this._reuseHandle(host, port);
       }
@@ -1055,10 +1204,12 @@ class ServerManager {
    *    shared instance — adopt it (non-owned handle), whatever window or
    *    terminal started it.
    *  - Step B (autoStart only): the configured port is silent, so scan this
-   *    environment's own processes (`ps` under WSL/Linux, PowerShell on
-   *    Windows — each OS only sees its own processes, which is what keeps
-   *    the Windows and WSL namespaces apart) for `dsh web` listeners on
-   *    other ports and adopt the first one that answers as DSH.
+   *    environment's processes (`ps` under WSL/Linux, PowerShell on Windows)
+   *    for `dsh web` listeners on other ports and adopt the first one that
+   *    answers as DSH. The scan itself drops Windows-shaped command lines off
+   *    win32 and adoption refuses a foreign registry entry, because WSL
+   *    interop means one environment's process table DOES show the other's
+   *    processes (see processDiscovery/isForeignCommandLine).
    *  - Step C: nobody home → spawn the environment's shared instance on the
    *    configured port when free (so later windows find it exactly there),
    *    scanning forward only past a non-DSH occupant. A simultaneous-start
@@ -1947,6 +2098,29 @@ class ServerManager {
           reject(new ServerError('DSH lifecycle operation was cancelled'));
           return;
         }
+        // Post-spawn environment verification (non-Windows hosts only — the
+        // observation is Linux /proc based and reports `unknown` elsewhere):
+        // the last line of defence behind assertNativeRuntimeEnvironment. A
+        // pre-spawn path check cannot see through a symlink into a foreign
+        // mount, nor through a shim that re-execs a Windows binary, and WSL
+        // interop makes the result observable only once the process exists
+        // (/proc/<pid>/comm ends in .exe, /proc/<pid>/exe -> /init). Checked
+        // on every round so the fork/exec race cannot hide it, and before any
+        // probe result is trusted: the child would answer every workspace
+        // path this window sends with workspace/invalid-path.
+        if (child.exitCode === null && detectProcessEnvironment(child.pid) === 'windows') {
+          settled = true;
+          if (this._child === child) this._child = null;
+          this._ownedServer = null;
+          child.removeListener('exit', onUnexpectedExit);
+          await this._killChild(child);
+          reject(new ServerError(
+            STARTUP_ERRORS.RUNTIME_FOREIGN_ENVIRONMENT.template,
+            { path: launch.command, host: hostEnvironmentLabel() },
+            'RUNTIME_FOREIGN_ENVIRONMENT'
+          ));
+          return;
+        }
         // dsh 0.1.2+ prints its authenticated URL (…/?token=…) to stdout at
         // readiness; older runtimes never do, so this stays null for them.
         const token = this._extractLaunchToken();
@@ -2038,6 +2212,14 @@ class ServerManager {
         // present on legacy entries (read compatibly as "no owner marker").
         vscodePid: this.ownerVscodePid,
         windowId: this.ownerWindowId,
+        // Which OS environment this instance RUNS in — observed from the
+        // process when this side can see it (an interop child spawned by a
+        // pre-fix WSL window is a Windows process whose runtime shape looks
+        // native), else the resolved runtime's own environment. Other
+        // environments' windows refuse to adopt a differing value, so a WSL
+        // window can never bind its workspace to a Windows-hosted DSH (whose
+        // every path check fails with workspace/invalid-path).
+        runtimeEnvironment: this.runtimeEnvironmentFor(pid),
         at: Date.now(),
         ...(logPath ? { log: logPath } : {}),
         // Cross-window sharing on dsh 0.1.2+: the launch token is what makes a

@@ -110,6 +110,27 @@ test('deleteWorkspace wraps business failures with the same error mapping', asyn
     (err) => err instanceof DshSessionError
       && err.code === 'DSH_SESSION_API_BUSINESS_ERROR'
       && err.businessCode === 'NOT_FOUND'
+      && err.message === 'DSH session API business error: NOT_FOUND: no such workspace'
+  );
+});
+
+test('deleteWorkspace surfaces the server message of a rejected workspace path', async () => {
+  // What a DSH hosted by the OTHER OS answers a workspace operation with; the
+  // binding page shows err.message, so the sentence has to survive the wrap.
+  await assert.rejects(
+    deleteWorkspace(BASE_URL, { workspaceId: 'w-1' }, {
+      fetchImpl: async () => jsonResponse(200, {
+        result: {
+          ok: false,
+          error: {
+            code: 'workspace/invalid-path',
+            message: "Workspace path is not fully qualified: '/home/andy/workspace'",
+          },
+        },
+      }),
+    }),
+    (err) => err.businessCode === 'workspace/invalid-path'
+      && err.message.includes("Workspace path is not fully qualified: '/home/andy/workspace'")
   );
 });
 

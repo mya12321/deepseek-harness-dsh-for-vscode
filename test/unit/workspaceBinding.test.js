@@ -343,6 +343,36 @@ test('API failure moves state to ERROR and returns null without throwing', async
   assert.ok(binding.state().error.includes('ECONNREFUSED'), binding.state().error);
 });
 
+test('a business failure keeps the DSH code and the server sentence for the status page', async () => {
+  // What a DSH hosted by the OTHER OS answers when a WSL workspace is created:
+  // the status page shows err.message and keys its hint off errorCode, so both
+  // halves have to survive the binding layer.
+  const fetchImpl = async () => jsonResponse(200, {
+    result: {
+      ok: false,
+      error: {
+        code: 'workspace/invalid-path',
+        message: "Workspace path is not fully qualified: '/home/andy/workspace'",
+      },
+    },
+  });
+  const binding = createWorkspaceBinding({
+    vscode: {},
+    baseUrlProvider: () => BASE_URL,
+    debounceMs: 0,
+    fetchImpl,
+  });
+  const sessionId = await binding.resolve({ url: BASE_URL, owned: true }, '/home/andy/workspace');
+
+  assert.strictEqual(sessionId, null);
+  assert.strictEqual(binding.state().state, BINDING_STATES.ERROR);
+  assert.strictEqual(binding.state().errorCode, 'workspace/invalid-path');
+  assert.ok(
+    binding.state().error.includes("Workspace path is not fully qualified: '/home/andy/workspace'"),
+    binding.state().error
+  );
+});
+
 test('debounce 250ms coalesces rapid resolve calls into one workspace.create', async () => {
   const api = createApi({
     workspaces: [

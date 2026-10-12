@@ -45,7 +45,8 @@
 		"test:package": "node scripts/check-package-contents.js",
 		"test:secrets": "node scripts/check-secrets.js",
 		"test:extension-host": "node test/extension-host/run.js",
-		"check:w0": "npm run lint && npm run test:unit && npm run test:package && npm run test:secrets"
+		"check:w0": "npm run lint && npm run test:unit && npm run test:package && npm run test:secrets",
+		"build": "vsce package"
 	},
 	"l10n": "./l10n",
 	"activationEvents": [

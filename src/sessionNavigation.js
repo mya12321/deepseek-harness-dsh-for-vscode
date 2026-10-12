@@ -197,15 +197,30 @@ function assertServerResponse(body) {
     );
   }
   if (result.ok === false) {
-    const errorCode = result.error && typeof result.error === "object"
-      ? result.error.code
-      : undefined;
+    const errorObject = result.error && typeof result.error === "object" && !Array.isArray(result.error)
+      ? result.error
+      : null;
+    const errorCode = errorObject ? errorObject.code : undefined;
+    // The server's own sentence is the actionable half of a business error:
+    // `workspace/invalid-path` alone says nothing, while "Workspace path is
+    // not fully qualified: '/home/…'" names the cause (a foreign-hosted DSH
+    // rejecting this side's paths). It used to be dropped from the message, so
+    // every surface that renders only err.message — sidebar status, output
+    // channel, diagnose — showed the code and nothing else.
+    const errorMessage = errorObject && typeof errorObject.message === "string" && errorObject.message.length > 0
+      ? errorObject.message
+      : null;
     const err = new DshSessionError(
       "DSH_SESSION_API_BUSINESS_ERROR",
-      "DSH session API business error" + (errorCode ? `: ${errorCode}` : "")
+      "DSH session API business error"
+        + (errorCode ? `: ${errorCode}` : "")
+        + (errorMessage ? `: ${errorMessage}` : "")
     );
     if (errorCode !== undefined) {
       err.businessCode = errorCode;
+    }
+    if (errorObject && errorObject.details !== undefined) {
+      err.businessDetails = errorObject.details;
     }
     throw err;
   }

@@ -52,6 +52,11 @@ const BINDING_STATES = Object.freeze({
 /**
  * Build the initial Binding value.
  *
+ * `errorCode` is the DSH API business code behind a failed bind (e.g.
+ * `workspace/invalid-path`), kept separate from the human-readable `error`
+ * text so callers can react to the CAUSE instead of matching prose; null
+ * whenever the binding is not in error.
+ *
  * @returns {object} A frozen Binding.
  */
 function initialBinding() {
@@ -62,6 +67,7 @@ function initialBinding() {
     sessionId: null,
     owned: false,
     error: null,
+    errorCode: null,
     at: Date.now(),
   });
 }
@@ -333,6 +339,7 @@ function createWorkspaceBinding({
         sessionId: cached.sessionId,
         owned,
         error: null,
+        errorCode: null,
       });
       return cached.sessionId;
     }
@@ -358,6 +365,7 @@ function createWorkspaceBinding({
         sessionId: null,
         owned,
         error: null,
+        errorCode: null,
       });
       // 0.1.5 has no workspace.list: create-or-adopt is the only probe.
       const created = await createWorkspace(baseUrl, cwd, { fetchImpl });
@@ -374,6 +382,7 @@ function createWorkspaceBinding({
           sessionId: null,
           owned,
           error: null,
+          errorCode: null,
         });
         const allowed = await requestConsentFor(cwd);
         if (!allowed) {
@@ -392,6 +401,7 @@ function createWorkspaceBinding({
             sessionId: null,
             owned,
             error: null,
+            errorCode: null,
           });
           return null;
         }
@@ -404,6 +414,7 @@ function createWorkspaceBinding({
         sessionId: null,
         owned,
         error: null,
+        errorCode: null,
       });
       const sessionId = await ensureWorkspaceRootSession(baseUrl, workspace, cwd, fetchImpl);
       cache.set(key, { workspaceId: workspace.workspaceId, sessionId });
@@ -414,6 +425,7 @@ function createWorkspaceBinding({
         sessionId,
         owned,
         error: null,
+        errorCode: null,
       });
       return sessionId;
     } catch (err) {
@@ -424,6 +436,13 @@ function createWorkspaceBinding({
         sessionId: binding.sessionId,
         owned,
         error: err && err.message ? err.message : String(err),
+        // The DSH API business code from the session layer
+        // (DSH_SESSION_API_BUSINESS_ERROR carries it), e.g.
+        // `workspace/invalid-path` — the machine-readable cause the status
+        // page turns into actionable guidance.
+        errorCode: err && typeof err.businessCode === "string" && err.businessCode.length > 0
+          ? err.businessCode
+          : null,
       });
       return null;
     }
@@ -489,6 +508,7 @@ function createWorkspaceBinding({
         sessionId: null,
         owned: Boolean(server && server.owned === true),
         error: null,
+        errorCode: null,
       });
 
       return new Promise((resolvePromise) => {
@@ -543,6 +563,7 @@ function createWorkspaceBinding({
           state: BINDING_STATES.BOUND,
           sessionId,
           error: null,
+          errorCode: null,
         });
       }
       return true;

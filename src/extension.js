@@ -841,6 +841,28 @@ function resolveEndpointPort(cfg) {
 }
 
 /**
+ * Detail line for a failed workspace binding.
+ *
+ * `workspace/invalid-path` on a non-Windows host is the signature of a DSH
+ * running in the OTHER OS environment: a Windows-hosted instance rejects
+ * every POSIX path with "Workspace path is not fully qualified". The server's
+ * own sentence is already part of the message (the session layer surfaces it);
+ * what the raw text lacks is the way out, so the hint names the action that
+ * resolves it — a restarted instance for THIS environment.
+ *
+ * @param {{error?: string|null, errorCode?: string|null}|null} bindingState
+ * @returns {string} Localized detail text.
+ */
+function bindingFailureDetail(bindingState) {
+  const base = (bindingState && bindingState.error) || loc("Unknown workspace binding error");
+  if (!bindingState || bindingState.errorCode !== 'workspace/invalid-path' || !runtimeEnvironment) {
+    return base;
+  }
+  if (runtimeEnvironment.id === 'windows') return base;
+  return base + ' — ' + loc('The DSH instance runs in another OS environment and cannot serve this window\'s paths. Run "Restart DSH Server" to start an instance for this environment.');
+}
+
+/**
  * True when the owned child is currently adopted by another live window.
  * Advisory: injected/fake managers without the method (older seams) and any
  * registry error resolve to false so the legacy stop behavior stands.
@@ -1025,7 +1047,7 @@ async function bindServer(context, server, cwd) {
     if (sessionId === null && bindingState.state === BINDING_STATES.ERROR) {
       render(statusPage({
         title: loc("DSH workspace binding failed"),
-        detail: bindingState.error || loc("Unknown workspace binding error"),
+        detail: bindingFailureDetail(bindingState),
         showRetry: true,
         retryLabel: loc("Retry"),
         lang: vscode.env.language,
@@ -1136,9 +1158,11 @@ async function connectNow(context) {
           // configured port is silent but a `dsh web` may be running on a
           // different port of this environment (leftover instance, a port
           // override in another window, a manual terminal session). Scan
-          // process command lines — the OS only sees its own processes, which
-          // keeps the Windows and WSL namespaces apart — then probe each
-          // discovered port before giving up.
+          // process command lines, then probe each discovered port before
+          // giving up. WSL interop means this side's process table DOES show
+          // the other environment's processes, so the scan itself drops
+          // Windows-shaped command lines (see processDiscovery) and every
+          // adoption is refused by the registry environment gate.
           try {
             const ports = await discoverRunningDshWebPorts({ platform: process.platform });
             for (const port of ports) {
@@ -1333,7 +1357,7 @@ async function rebindToWorkspace(context) {
   if (sessionId === null && bindingState.state === BINDING_STATES.ERROR) {
     render(statusPage({
       title: loc("DSH workspace binding failed"),
-      detail: bindingState.error || loc("Unknown workspace binding error"),
+      detail: bindingFailureDetail(bindingState),
       showRetry: true,
       retryLabel: loc("Retry"),
       lang: vscode.env.language,
@@ -1748,8 +1772,14 @@ async function setupCoreServer({ context, services }) {
     services.manager?.setSpawnEnv?.(watchdogEnv);
   }
   // Stamp this window's owner identity so every ready registry entry carries
-  // vscodePid + windowId (the activation scan tree-kills only dead owners).
-  services.manager?.setOwnerIdentity?.({ vscodePid: process.pid, windowId: ownerWindowId });
+  // vscodePid + windowId (the activation scan tree-kills only dead owners),
+  // plus the OS environment this window IS — the value adoption compares a
+  // running instance's environment against.
+  services.manager?.setOwnerIdentity?.({
+    vscodePid: process.pid,
+    windowId: ownerWindowId,
+    environment: runtimeEnvironment ? runtimeEnvironment.id : null,
+  });
   // Prune dead registry entries (best effort). NEVER kills live instances —
   // they may belong to another VS Code window with its own workspace.
   try {

@@ -20,6 +20,13 @@ const { execFile } = require('node:child_process');
  * (live bug 2026-09-18: two VS Code windows of one WSL environment each
  * spawned their own DSH), so the narrowing happens here, where it is testable.
  *
+ * On a WSL host the scan additionally has to DROP the other environment's
+ * processes: WSL interop lets this side's `ps` see Windows processes
+ * (`/init /mnt/c/…/node.exe … --port 3081`), and a Windows-hosted DSH answers
+ * every workspace path of this side with `workspace/invalid-path` — adopting
+ * one is precisely the failure this discovery layer must not enable. See
+ * isForeignCommandLine.
+ *
  * The PowerShell/ps scanning approach is credited to the MIT-licensed
  * DM010727/dsh-cline project (packages/extension/src/extension.ts,
  * discoverDshWebUrls), hardened here with a cache, injectable exec, and
@@ -56,17 +63,44 @@ function looksLikeDshListener(command) {
 }
 
 /**
+ * Whether one scan line describes a process running in the OTHER OS
+ * environment.
+ *
+ * On Linux, WSL interop exposes a Windows process as
+ * `/init /mnt/c/…/node.exe node.exe C:\…\dsh\lib\bin.js … --port 3081`, so the
+ * interop launcher, a `.exe` command word, or a Windows drive path marks the
+ * line. Such a process sees only Windows paths — adopting it is what makes a
+ * WSL window fail every workspace with `workspace/invalid-path` — while a
+ * native `dsh web` command line contains none of the three, so this filter is
+ * inert for every line worth keeping.
+ *
+ * @param {string} command - One `ps`/PowerShell command line.
+ * @param {string} [platform] - Host platform the line was scanned on.
+ * @returns {boolean} True when the line can only be a foreign process.
+ */
+function isForeignCommandLine(command, platform = process.platform) {
+  if (platform === 'win32') return false;
+  const line = String(command === undefined || command === null ? '' : command);
+  return /(^|\s)\/init(\s|$)/.test(line)
+    || /\.exe(\s|$)/i.test(line)
+    || /[A-Za-z]:[\\/]/.test(line);
+}
+
+/**
  * Extract `--port` values from scan output, keeping only lines that look like
- * a dsh web listener (see looksLikeDshListener). Port 0 (dsh's own "pick a
- * free port" value) is never a usable target.
+ * a dsh web listener (see looksLikeDshListener) and that belong to THIS OS
+ * environment (see isForeignCommandLine). Port 0 (dsh's own "pick a free
+ * port" value) is never a usable target.
  *
  * @param {string} stdout - Raw scan output, one command line per row.
+ * @param {{platform?: string}} [options] - Host platform the scan ran on.
  * @returns {number[]} Unique ports in order of appearance.
  */
-function parsePorts(stdout) {
+function parsePorts(stdout, { platform = process.platform } = {}) {
   const ports = [];
   for (const line of String(stdout || '').split(/\r?\n/)) {
     if (!looksLikeDshListener(line)) continue;
+    if (isForeignCommandLine(line, platform)) continue;
     const port = /--port[= ](\d+)/.exec(line)?.[1];
     if (port !== undefined && port !== '0') ports.push(Number(port));
   }
@@ -111,7 +145,7 @@ async function discoverDshWebPorts({ platform = process.platform, execFn } = {})
   for (const command of scanCommands(platform)) {
     try {
       const stdout = await run(command.file, command.args);
-      ports = parsePorts(stdout);
+      ports = parsePorts(stdout, { platform });
     } catch {
       ports = []; // best-effort only: a missing powershell/ps never throws
     }
@@ -128,4 +162,10 @@ discoverDshWebPorts.resetCache = function resetCache() {
   discoverDshWebPorts._cacheAt = 0;
 };
 
-module.exports = { discoverDshWebPorts, looksLikeDshListener, parsePorts, scanCommands };
+module.exports = {
+  discoverDshWebPorts,
+  isForeignCommandLine,
+  looksLikeDshListener,
+  parsePorts,
+  scanCommands,
+};

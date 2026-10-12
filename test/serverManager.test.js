@@ -19,6 +19,7 @@ const {
   sameEndpoint,
   reconcileConfigChange,
 } = require('../src/serverManager');
+const { detectRuntimeEnvironment } = require('../src/runtimeEnvironment');
 
 const SELF_TEST_PORT_SCAN_LIMIT = 50;
 
@@ -1377,4 +1378,296 @@ test('launchTokenFromSpawnLog extracts the token and tolerates missing files', (
 
   assert.strictEqual(ServerManager.launchTokenFromSpawnLog(logFile + '.missing'), null);
   assert.strictEqual(ServerManager.launchTokenFromSpawnLog(null), null);
+});
+
+// ---------------------------------------------------------------------------
+// Cross-environment isolation (live bug 2026-10-12).
+//
+// A WSL window whose PATH held only the Windows-side pnpm shim started a
+// Windows-hosted DSH, and every window of that environment then adopted it:
+// the instance sees only Windows paths, so each `workspace/create` answered
+// `workspace/invalid-path` and the sidebar could not bind at all. The
+// registry now stamps the environment an instance runs in and every adoption
+// path refuses a differing one.
+// ---------------------------------------------------------------------------
+
+test('_adoptionFacts trusts a stamped environment and observes only pre-stamp entries', async (t) => {
+  const file = path.join(os.tmpdir(), `dsh-facts-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  const entry = { pid: process.pid, port: 4460, host: '127.0.0.1', cwd: null, at: Date.now() };
+
+  fs.writeFileSync(file, JSON.stringify([{ ...entry, runtimeEnvironment: 'windows' }]));
+  assert.strictEqual(
+    ServerManager._adoptionFacts(file, '127.0.0.1', 4460, 'wsl').foreign, true,
+    'a Windows-stamped instance is foreign to a WSL window'
+  );
+  assert.strictEqual(
+    ServerManager._adoptionFacts(file, '127.0.0.1', 4460, 'windows').foreign, false,
+    'the same instance is native to a Windows window'
+  );
+
+  // Pre-stamp entry: the field is absent, so the process is asked — WSL
+  // interop is observable in /proc, which is the only way to catch a child
+  // an older version spawned from a /mnt/c shim.
+  fs.writeFileSync(file, JSON.stringify([entry]));
+  const observed = [];
+  const deps = { detectProcessEnvironment: (pid) => { observed.push(pid); return 'windows'; } };
+  assert.strictEqual(ServerManager._adoptionFacts(file, '127.0.0.1', 4460, 'wsl', deps).foreign, true);
+  assert.deepStrictEqual(observed, [process.pid]);
+  // An unobservable process is never foreign: adoption must stay intact on
+  // every platform this side cannot inspect.
+  assert.strictEqual(ServerManager._adoptionFacts(file, '127.0.0.1', 4460, 'wsl', {
+    detectProcessEnvironment: () => 'unknown',
+  }).foreign, false);
+
+  // Port/host mismatch or a dead pid: no live entry, no verdict, no refusal.
+  assert.deepStrictEqual(ServerManager._adoptionFacts(file, '127.0.0.1', 4461, 'wsl'), {
+    entry: null, foreign: false,
+  });
+});
+
+test('adoptRunningDsh refuses a foreign instance without probing it', async (t) => {
+  const file = path.join(os.tmpdir(), `dsh-foreign-adopt-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  // Nothing listens on 4462: the refusal has to come from the registry
+  // evidence alone, before any probe spends the settle budget on an instance
+  // this window can never use.
+  fs.writeFileSync(file, JSON.stringify([
+    {
+      pid: process.pid, port: 4462, host: '127.0.0.1', cwd: null,
+      vscodePid: 424242, windowId: 'w-windows', at: Date.now(), runtimeEnvironment: 'windows',
+    },
+  ], null, 2));
+
+  const statuses = [];
+  const manager = new ServerManager({ onStatus: (status) => statuses.push(status) });
+  manager.setOwnerIdentity({ vscodePid: process.pid, windowId: 'w-wsl', environment: 'wsl' });
+  t.after(() => manager.stop());
+
+  assert.strictEqual(
+    await manager.adoptRunningDsh('127.0.0.1', 4462, { registryFile: file, settleMs: 500 }),
+    null
+  );
+  assert.deepStrictEqual(
+    JSON.parse(fs.readFileSync(file, 'utf8')).map((e) => e.pid), [process.pid],
+    'a SIBLING window’s instance is never killed or unregistered — only refused'
+  );
+  const refusals = statuses.filter((status) => status.state === 'selfheal');
+  assert.strictEqual(refusals.length, 1, 'the refusal is reported once, not once per settle round');
+  assert.match(refusals[0].message, /another OS environment/);
+  assert.strictEqual(refusals[0].params.port, 4462);
+  assert.ok(typeof refusals[0].params.environment === 'string' && refusals[0].params.environment.length > 0);
+});
+
+test('a foreign instance owned by this window is stopped and unregistered', async (t) => {
+  // The window that spawned the foreign child itself (a spawn from before this
+  // gate existed, or a stale entry): the activation sweep deliberately leaves
+  // current-window entries alone, so nothing else would ever clean it up.
+  // A detached child stands in for the DSH process and is its own process
+  // group, so the tree-kill cannot reach anything but it.
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  t.after(() => {
+    try { process.kill(child.pid, 'SIGKILL'); } catch { /* already stopped */ }
+  });
+
+  const file = path.join(os.tmpdir(), `dsh-foreign-own-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    {
+      pid: child.pid, port: 4463, host: '127.0.0.1', cwd: null,
+      vscodePid: process.pid, windowId: 'w-owner', at: Date.now(), runtimeEnvironment: 'windows',
+    },
+  ], null, 2));
+
+  const manager = new ServerManager();
+  manager.setOwnerIdentity({ vscodePid: process.pid, windowId: 'w-owner', environment: 'wsl' });
+  t.after(() => manager.stop());
+
+  assert.strictEqual(await manager.adoptRunningDsh('127.0.0.1', 4463, { registryFile: file }), null);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')), [],
+    'its registry entry is dropped so the next pass can start a native instance');
+
+  if (child.exitCode === null && child.signalCode === null) {
+    await new Promise((resolve) => {
+      child.once('exit', resolve);
+      setTimeout(resolve, 5000).unref();
+    });
+  }
+  assert.ok(
+    child.exitCode !== null || child.signalCode !== null,
+    'the foreign child of this window must actually be stopped'
+  );
+});
+
+test('an instance stamped with this window’s own environment is still adopted', async (t) => {
+  const dshServer = createDshHttpServer();
+  await listen(dshServer);
+  const port = dshServer.address().port;
+  t.after(() => close(dshServer));
+
+  const file = path.join(os.tmpdir(), `dsh-native-adopt-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    {
+      pid: process.pid, port, host: '127.0.0.1', cwd: null,
+      vscodePid: 424242, windowId: 'w-origin', at: Date.now(), runtimeEnvironment: 'wsl',
+    },
+  ], null, 2));
+
+  const manager = new ServerManager();
+  manager.setOwnerIdentity({ vscodePid: process.pid, windowId: 'w-adopter', environment: 'wsl' });
+  t.after(() => manager.stop());
+  const handle = await manager.adoptRunningDsh('127.0.0.1', port, { registryFile: file });
+
+  assert.ok(handle, 'the same environment’s instance stays adoptable');
+  assert.strictEqual(handle.owned, false);
+  assert.strictEqual(handle.managed, true);
+  assert.strictEqual(handle.pid, process.pid);
+});
+
+class PortRecordingManager extends ServerManager {
+  constructor() {
+    super();
+    this.spawnedPort = null;
+  }
+
+  async _spawnAndWait(host, port) {
+    this.spawnedPort = port;
+    throw new Error('spawn-branch-reached');
+  }
+}
+
+test('shared mode scans past a foreign occupant instead of adopting or colliding', async (t) => {
+  const dshServer = createDshHttpServer();
+  await listen(dshServer);
+  const port = dshServer.address().port;
+  t.after(() => close(dshServer));
+
+  const file = path.join(os.tmpdir(), `dsh-shared-foreign-occ-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    {
+      pid: process.pid, port, host: '127.0.0.1', cwd: null,
+      vscodePid: 424242, windowId: 'w-windows', at: Date.now(), runtimeEnvironment: 'windows',
+    },
+  ], null, 2));
+
+  const manager = new PortRecordingManager();
+  manager.setOwnerIdentity({ vscodePid: process.pid, windowId: 'w-wsl', environment: 'wsl' });
+  t.after(() => manager.stop());
+  await assert.rejects(
+    manager.ensureServer({
+      host: '127.0.0.1', port, autoStart: true, cwd: null, registryFile: file, shareMode: 'environment',
+      discoverDshWebPorts: async () => [],
+    }),
+    /spawn-branch-reached/
+  );
+  assert.ok(
+    manager.spawnedPort > port,
+    `the foreign occupant keeps its port; this window spawns past it (got ${manager.spawnedPort})`
+  );
+});
+
+test('the activation sweep treats a foreign entry like any other window’s child', async (t) => {
+  // The sweep is about dead OWNERS, not about environments: a foreign entry of
+  // a live window must survive untouched, and one whose owner died is cleaned
+  // up by the same rules as a native child (nothing else would ever remove it).
+  const file = path.join(os.tmpdir(), `dsh-sweep-foreign-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    { pid: 7101, port: 4470, host: '127.0.0.1', vscodePid: 9201, at: 1, runtimeEnvironment: 'windows' },
+    { pid: 7102, port: 4471, host: '127.0.0.1', vscodePid: 9202, at: 2, runtimeEnvironment: 'windows' },
+  ], null, 2));
+  const terminated = [];
+
+  const swept = await ServerManager.sweepDeadOwnerEntries(file, {
+    terminate: async (pid) => { terminated.push(pid); },
+    isProcessAlive: (pid) => pid === 9201, // 9201 alive, 9202 dead
+    verify: () => null, // hermetic: skip the real process-identity check
+    currentVscodePid: null,
+  });
+
+  assert.deepStrictEqual(swept.map((entry) => entry.pid), [7102]);
+  assert.deepStrictEqual(terminated, [7102], 'a live window’s child is never touched');
+  assert.deepStrictEqual(
+    JSON.parse(fs.readFileSync(file, 'utf8')).map((entry) => entry.pid), [7101]
+  );
+});
+
+test('_finalizeReady stamps the environment the child runs in', (t) => {
+  const file = path.join(os.tmpdir(), `dsh-env-stamp-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+
+  // An observable process wins: /proc is the only witness for a child spawned
+  // from a foreign shim, whose resolved runtime shape looks native.
+  const observed = new ServerManager();
+  observed.setOwnerIdentity({ vscodePid: 4242, windowId: 'w-1', environment: 'wsl' });
+  observed.runtimeEnvironmentFor = () => 'wsl';
+  observed._finalizeReady('127.0.0.1', 4472, null, 98771, file);
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8'))[0].runtimeEnvironment, 'wsl');
+
+  // Then the resolved runtime's own environment, then this host's.
+  const dshHome = path.join(os.tmpdir(), `dsh-env-home-${process.pid}`);
+  const declared = new ServerManager({
+    resolvedRuntime: {
+      executablePath: process.execPath,
+      dshHome,
+      profileHome: path.join(dshHome, 'profiles', 'web'),
+      profileName: 'web',
+      entrypointArgs: [],
+    },
+  });
+  declared.setOwnerIdentity({ vscodePid: 4242, windowId: 'w-2', environment: 'linux' });
+  declared._finalizeReady('127.0.0.1', 4473, null, 98772, file);
+  assert.strictEqual(
+    JSON.parse(fs.readFileSync(file, 'utf8'))[0].runtimeEnvironment,
+    detectRuntimeEnvironment().id,
+    'the resolved runtime carries the environment it was resolved FOR'
+  );
+
+  const host = new ServerManager();
+  host.setOwnerIdentity({ vscodePid: 4242, windowId: 'w-3', environment: 'linux' });
+  host._finalizeReady('127.0.0.1', 4474, null, 98773, file);
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8'))[0].runtimeEnvironment, 'linux');
+});
+
+test('autoStart=false refuses a foreign instance on the configured port', async (t) => {
+  // This path adopts anything reachable without a registry lookup, so it can
+  // only be gated on registry EVIDENCE: an entry naming the other environment
+  // is refused (and, being un-recoverable here, surfaced as an error), while
+  // a hand-started `dsh web` with no entry stays adoptable.
+  const dshServer = createDshHttpServer();
+  await listen(dshServer);
+  const port = dshServer.address().port;
+  t.after(() => close(dshServer));
+
+  const file = path.join(os.tmpdir(), `dsh-step3-foreign-${process.pid}-${Date.now()}.json`);
+  t.after(() => fs.rmSync(file, { force: true }));
+  fs.writeFileSync(file, JSON.stringify([
+    {
+      pid: process.pid, port, host: '127.0.0.1', cwd: null,
+      vscodePid: 424242, windowId: 'w-windows', at: Date.now(), runtimeEnvironment: 'windows',
+    },
+  ], null, 2));
+
+  const manager = new ServerManager();
+  manager.setOwnerIdentity({ vscodePid: process.pid, windowId: 'w-wsl', environment: 'wsl' });
+  t.after(() => manager.stop());
+  await assert.rejects(
+    manager.ensureServer({ host: '127.0.0.1', port, autoStart: false, cwd: null, registryFile: file }),
+    (error) => error.code === 'RUNTIME_FOREIGN_INSTANCE'
+      && error.params.port === port
+      && typeof error.params.host === 'string'
+  );
+
+  // Same port, no entry: the user's own `dsh web` is still adopted.
+  fs.writeFileSync(file, '[]');
+  const handle = await manager.ensureServer({
+    host: '127.0.0.1', port, autoStart: false, cwd: null, registryFile: file,
+  });
+  assert.strictEqual(handle.owned, false);
+  assert.strictEqual(handle.port, port);
 });

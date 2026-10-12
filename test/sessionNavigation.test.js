@@ -118,6 +118,41 @@ test('listSessions wraps business failures and carries error.code', async () => 
   );
 });
 
+test('listSessions carries the server message and details of a business failure', async () => {
+  // The real payload a Windows-hosted DSH answers a WSL window with. The code
+  // alone told the user nothing; the server's sentence names the cause, and
+  // the binding surface renders err.message.
+  await assert.rejects(
+    listSessions(BASE_URL, {
+      fetchImpl: async () => jsonResponse(200, {
+        result: {
+          ok: false,
+          error: {
+            code: 'workspace/invalid-path',
+            message: "Workspace path is not fully qualified: '/home/andy/workspace'",
+            details: { path: '/home/andy/workspace' },
+          },
+        },
+      }),
+    }),
+    (err) => err instanceof DshSessionError
+      && err.code === 'DSH_SESSION_API_BUSINESS_ERROR'
+      && err.businessCode === 'workspace/invalid-path'
+      && err.message.includes('workspace/invalid-path')
+      && err.message.includes("Workspace path is not fully qualified: '/home/andy/workspace'")
+      && err.businessDetails.path === '/home/andy/workspace'
+  );
+
+  // A code-only failure keeps today's wording and gains no empty detail.
+  await assert.rejects(
+    listSessions(BASE_URL, {
+      fetchImpl: async () => jsonResponse(200, { result: { ok: false, error: { code: 'NO_SESSION' } } }),
+    }),
+    (err) => err.message === 'DSH session API business error: NO_SESSION'
+      && !('businessDetails' in err)
+  );
+});
+
 test('listSessions rejects non-loopback base URLs', async () => {
   for (const bad of [
     'http://example.com:3080',

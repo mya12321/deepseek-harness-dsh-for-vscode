@@ -22,12 +22,27 @@
  * topology then), and user-managed mode (autoStart=false) is never shifted
  * for backward compatibility.
  *
+ * The same "whose DSH do I talk to" split has a second half: a WSL window must
+ * never *launch* (or adopt) a Windows-hosted DSH, because that process sees
+ * only Windows paths and rejects every WSL workspace path with
+ * `workspace/invalid-path`. WSL interop makes that failure mode easy to reach
+ * — a `/mnt/c` pnpm shim spawned from Linux re-execs `node.exe` (its own
+ * `uname -a` sees `*WSL2*` and it prefers a Windows node), and the resulting
+ * process is visible to this side's `ps` with `/proc/<pid>/comm` = `node.exe`
+ * and `/proc/<pid>/exe` -> `/init`. The primitives below identify that class:
+ * which mounts belong to another OS (windowsMountRoots/isForeignHostPath) and
+ * whether an existing process is a foreign one (detectProcessEnvironment).
+ *
  * Zero external dependencies: only Node built-ins are used.
  */
 
 const fs = require('node:fs');
 
 const OS_RELEASE_PATH = '/proc/sys/kernel/osrelease';
+const PROC_MOUNTS_PATH = '/proc/mounts';
+
+/** Filesystem types that carry another OS's drives into a Linux mount table. */
+const FOREIGN_FS_TYPES = /^(drvfs|9p|virtiofs|v9fs)$/i;
 
 /** Allowed values of the `dsh.share.mode` setting. */
 const SHARE_MODES = Object.freeze({
@@ -162,10 +177,167 @@ function resolveSharedEndpointPort({
   return shift ? WSL_SHARED_DEFAULT_PORT : port;
 }
 
+/**
+ * Short human-readable label of this extension host's environment, for
+ * messages that must tell the user which side of the Windows/WSL split a
+ * runtime belongs to ("this WSL window needs a DSH installed for its own OS").
+ *
+ * @param {object} [options] - Same overrides as detectRuntimeEnvironment.
+ * @returns {string} e.g. 'Windows', 'WSL', 'Linux', 'macOS'.
+ */
+function hostEnvironmentLabel({ platform = process.platform, env = process.env } = {}) {
+  const id = detectRuntimeEnvironment({ platform, env }).id;
+  if (id === 'windows') return 'Windows';
+  if (id === 'wsl') return 'WSL';
+  if (id === 'linux') return 'Linux';
+  return platform === 'darwin' ? 'macOS' : String(platform);
+}
+
+/** Memoized mount-table reads, keyed by mountPath (mirrors osReleaseCache). */
+const mountRootsCache = new Map();
+
+/** Decode the octal escapes (/proc/mounts writes `\040` for a space). */
+function decodeMountToken(token) {
+  return String(token).replace(/\\([0-7]{3})/g, (_, octal) =>
+    String.fromCharCode(parseInt(octal, 8))
+  );
+}
+
+/**
+ * Mount points under which another OS's filesystem is reachable.
+ *
+ * `/proc/mounts` shows a WSL drive mount as
+ *   `C:\134 /mnt/c 9p rw,noatime,dirsync,aname=drvfs;path=C:\;uid=1000;…`
+ * (the device is the escaped Windows path, `C:\134` being `C:\`). Only
+ * drvfs/9p/virtiofs-style mounts whose device is a drive letter count: a plain
+ * `/mnt/data` on ext4 is a native Linux mount and must NOT be reported, which
+ * is why the mount table — not the `/mnt/<letter>` shape alone — is the
+ * primary source. The `/mnt/<letter>` shape is used only as a fallback when
+ * the table cannot be read at all (hardened containers), and never off Linux.
+ *
+ * @param {object} [options]
+ * @param {string} [options.mountPath] - Override /proc/mounts.
+ * @param {string} [options.platform] - Override process.platform.
+ * @param {(path: string) => string} [options.readFile] - Sync reader (injectable).
+ * @param {boolean} [options.fresh] - Bypass the memoization cache.
+ * @returns {string[]} Absolute mount points, e.g. ['/mnt/c'].
+ */
+function windowsMountRoots({
+  mountPath = PROC_MOUNTS_PATH,
+  platform = process.platform,
+  readFile = (candidate) => fs.readFileSync(candidate, 'utf8'),
+  fresh = false,
+} = {}) {
+  if (platform !== 'linux') return [];
+  if (!fresh && mountRootsCache.has(mountPath)) return mountRootsCache.get(mountPath);
+  let content = '';
+  try {
+    content = String(readFile(mountPath) || '');
+  } catch {
+    content = '';
+  }
+  const roots = [];
+  for (const line of content.split('\n')) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 3) continue;
+    const [device, mountPoint, fsType] = fields;
+    if (!/^[A-Za-z]:/.test(decodeMountToken(device))) continue;
+    if (!FOREIGN_FS_TYPES.test(fsType)) continue;
+    const decoded = decodeMountToken(mountPoint);
+    if (decoded.startsWith('/') && !roots.includes(decoded)) roots.push(decoded);
+  }
+  // No usable evidence (unreadable/empty table): fall back to the drive-mount
+  // naming convention. `/mnt/wslg` and `/mnt/wsl` deliberately do not match
+  // ([a-z] followed by end-or-slash), so only single-letter drives qualify.
+  if (roots.length === 0 && content.trim() === '' && fs.existsSync('/mnt/c')) {
+    roots.push('/mnt/c');
+  }
+  const frozen = Object.freeze(roots);
+  mountRootsCache.set(mountPath, frozen);
+  return frozen;
+}
+
+/**
+ * Whether an absolute path belongs to the OTHER OS environment: a Windows
+ * drive path spelled for a POSIX host, or any path under a foreign mount
+ * (see windowsMountRoots). False on win32 and for relative/non-string input,
+ * so callers never need to gate the check themselves.
+ *
+ * @param {*} candidate - Path to classify.
+ * @param {object} [options]
+ * @param {string} [options.platform] - Override process.platform.
+ * @param {string[]} [options.mountRoots] - Override the mount points.
+ * @param {string} [options.mountPath] - Override /proc/mounts for the lookup.
+ * @param {(path: string) => string} [options.readFile] - Sync reader (injectable).
+ * @returns {boolean}
+ */
+function isForeignHostPath(candidate, {
+  platform = process.platform,
+  mountRoots = null,
+  mountPath = PROC_MOUNTS_PATH,
+  readFile,
+} = {}) {
+  if (platform === 'win32') return false;
+  if (typeof candidate !== 'string' || candidate.length === 0) return false;
+  // A drive-letter spelling can never name a native path off Windows.
+  if (/^[A-Za-z]:[\\/]/.test(candidate)) return true;
+  if (!candidate.startsWith('/')) return false;
+  const roots = mountRoots || windowsMountRoots({ platform, mountPath, readFile });
+  for (const root of roots) {
+    if (candidate === root || candidate.startsWith(root.endsWith('/') ? root : `${root}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Environment of an existing process, as far as this side can observe it.
+ *
+ * WSL interop runs a Windows binary through `/init`, so `/proc/<pid>/comm`
+ * ends in `.exe` (e.g. `node.exe`) and `/proc/<pid>/exe` points at `/init`.
+ * Anything else — including every process on a non-Linux host, where /proc
+ * does not exist — is `unknown`, and callers must treat `unknown` as "not
+ * foreign" so adoption is never regressed on platforms we cannot inspect.
+ *
+ * @param {number} pid - Process id to classify.
+ * @param {object} [options]
+ * @param {string} [options.platform] - Override process.platform.
+ * @param {string} [options.procRoot] - Override /proc.
+ * @param {(path: string) => string} [options.readFile] - Sync reader (injectable).
+ * @param {(path: string) => string} [options.readlink] - Sync link reader (injectable).
+ * @returns {'windows'|'unknown'}
+ */
+function detectProcessEnvironment(pid, {
+  platform = process.platform,
+  procRoot = '/proc',
+  readFile = (candidate) => fs.readFileSync(candidate, 'utf8'),
+  readlink = (candidate) => fs.readlinkSync(candidate),
+} = {}) {
+  if (platform !== 'linux') return 'unknown';
+  if (!Number.isInteger(pid) || pid <= 0) return 'unknown';
+  try {
+    const comm = String(readFile(`${procRoot}/${pid}/comm`) || '').trim();
+    if (/\.exe$/i.test(comm)) return 'windows';
+  } catch {
+    // fall through to the exe link: a process may exit between the two reads
+  }
+  try {
+    if (String(readlink(`${procRoot}/${pid}/exe`) || '') === '/init') return 'windows';
+  } catch {
+    // unreadable (permissions, gone): unknown
+  }
+  return 'unknown';
+}
+
 module.exports = {
   SHARE_MODES,
   WSL_SHARED_DEFAULT_PORT,
   normalizeShareMode,
   detectRuntimeEnvironment,
   resolveSharedEndpointPort,
+  hostEnvironmentLabel,
+  windowsMountRoots,
+  isForeignHostPath,
+  detectProcessEnvironment,
 };
