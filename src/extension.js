@@ -1005,7 +1005,6 @@ async function bindServer(context, server, cwd) {
   // feature config into the running plugin. Fire-and-forget: a slow or
   // failing push must never delay the sidebar bind.
   void pushBridgeConfigure(server);
-  boundCwd = cwd;
   // SM-3: fenced runtimes (dsh 0.1.2+) embed through the extension's
   // authenticating loopback proxy — a webview iframe cannot carry dsh's
   // SameSite=Strict cookie; older servers embed their plain URL directly.
@@ -1045,6 +1044,11 @@ async function bindServer(context, server, cwd) {
     // workspace wins), so only treat THIS resolve as failed when it returned
     // no session and the latest state is the ERROR state.
     if (sessionId === null && bindingState.state === BINDING_STATES.ERROR) {
+      // A failed bind must NOT claim the cwd: boundCwd gates scheduleRebind()
+      // and a later active-editor change would otherwise early-return and
+      // leave the sidebar permanently unbound.
+      boundCwd = null;
+      appendDiagnostic(`[workspace] binding failed for ${cwd}: ${bindingState.error || 'unknown error'}`);
       render(statusPage({
         title: loc("DSH workspace binding failed"),
         detail: bindingFailureDetail(bindingState),
@@ -1058,6 +1062,10 @@ async function bindServer(context, server, cwd) {
     currentSessionId = null;
     followEditProjection(null);
   }
+  // Consent-declined (UNBOUND) still counts as "handled for this root": the
+  // user must not be re-prompted on every active-editor change. Only a real
+  // ERROR leaves boundCwd null so a later rebind retries.
+  boundCwd = cwd || null;
   renderFrame(context);
 }
 
@@ -1076,7 +1084,6 @@ async function connectNow(context) {
         manager.setExtraArgs([]);
       }
     }
-    const cwd = hostContext.workspaceCwd();
     setStatusBar("$(radio-tower) " + loc("DSH: connecting…"));
     render(statusPage({ title: loc("Connecting to DeepSeek Harness…"), detail: "", lang: vscode.env.language }));
 
@@ -1193,13 +1200,27 @@ async function connectNow(context) {
         host: cfg.host,
         port: resolveEndpointPort(cfg),
         autoStart: cfg.autoStart,
-        cwd,
+        // Read the workspace root as late as possible: runtime provisioning
+        // and a cold DSH boot can take long enough for the user to switch
+        // folders, and the child must spawn in the folder that is current at
+        // spawn time, not the one that was current when Retry was pressed.
+        cwd: hostContext.workspaceCwd(),
         registryFile: hostContext.registryFilePath(),
         shareMode: cfg.shareMode,
         discoverDshWebPorts: discoverRunningDshWebPorts,
       });
     }
-    await bindServer(context, server, cwd);
+    // Bind to the root that is current AFTER the wait for the server. The
+    // pre-ensure cwd can be a folder the user already left (cold start can
+    // take a minute), which left the sidebar showing the old workspace's
+    // session until an unrelated rebind event arrived.
+    await bindServer(context, server, hostContext.workspaceCwd());
+    // Folders can also become available without an onDidChangeWorkspaceFolders
+    // event (activation ordering), or change again during the bind. Reconcile
+    // once here so the sidebar cannot stay on a stale root.
+    if (!hostContext.sameRoot(hostContext.workspaceCwd(), boundCwd)) {
+      scheduleRebind(context);
+    }
   } catch (err) {
     currentServer = null;
     boundCwd = null;
@@ -1328,7 +1349,6 @@ async function rebindToWorkspace(context) {
   // Approved editor attachments are workspace-scoped; a root change must
   // never leak the previous workspace's content into the new DSH instance.
   editorContext?.clearAttachments();
-  boundCwd = cwd;
   render(statusPage({
     title: loc("Connecting to DeepSeek Harness…"),
     detail: loc("Workspace changed — rebinding to the new workspace…"),
@@ -1355,6 +1375,10 @@ async function rebindToWorkspace(context) {
   // Only treat THIS resolve as failed (see bindServer): the controller-wide
   // state may already belong to a newer pass.
   if (sessionId === null && bindingState.state === BINDING_STATES.ERROR) {
+    // Keep the root unclaimed so the next editor/folder change retries instead
+    // of early-returning on a cwd that never actually bound.
+    boundCwd = null;
+    appendDiagnostic(`[workspace] rebind failed for ${cwd}: ${bindingState.error || 'unknown error'}`);
     render(statusPage({
       title: loc("DSH workspace binding failed"),
       detail: bindingFailureDetail(bindingState),
@@ -1364,6 +1388,9 @@ async function rebindToWorkspace(context) {
     }));
     return;
   }
+  // Consent-declined (UNBOUND) is a handled state for this root; only ERROR
+  // stays unclaimed.
+  boundCwd = cwd || null;
   renderFrame(context);
 }
 

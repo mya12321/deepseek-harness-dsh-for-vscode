@@ -1671,3 +1671,72 @@ test('autoStart=false refuses a foreign instance on the configured port', async 
   assert.strictEqual(handle.owned, false);
   assert.strictEqual(handle.port, port);
 });
+
+test('shared port scan stops at a fenced DSH instead of spawning past it', async (t) => {
+  const fenced = net.createServer((socket) => {
+    socket.once('data', () => {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+    });
+  });
+  await listen(fenced);
+  const fencedPort = fenced.address().port;
+  t.after(() => close(fenced));
+
+  const manager = new ServerManager();
+  await assert.rejects(
+    manager._findFreePort('127.0.0.1', fencedPort, { shared: true, guardedPort: fencedPort }),
+    (error) => error.code === 'SHARED_SIBLING_FOUND'
+      && error.params.port === fencedPort,
+    'a 401 (auth fence) is a DSH sibling, not an occupied port to scan past'
+  );
+
+  const plain = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('hello');
+  });
+  await listen(plain);
+  const plainPort = plain.address().port;
+  t.after(() => close(plain));
+  const free = await manager._findFreePort('127.0.0.1', plainPort, { shared: true, guardedPort: plainPort });
+  assert.ok(free > plainPort, 'a non-DSH occupant is still scanned past');
+});
+
+test('a throwing startup health poll rejects instead of leaving Retry pending forever', async () => {
+  const executable = path.join(
+    os.tmpdir(),
+    `dsh-poll-throw-runtime-${process.pid}${process.platform === 'win32' ? '.exe' : ''}`
+  );
+  fs.writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const child = new EventEmitter();
+  child.pid = 77001;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = () => {};
+  const manager = new ServerManager({ spawnFn: () => child });
+  manager.setResolvedRuntime({
+    executablePath: executable,
+    dshHome: os.tmpdir(),
+    profileHome: path.join(os.tmpdir(), 'profiles', 'web'),
+  });
+  manager.probe = async () => { throw new Error('probe exploded'); };
+
+  let timer = null;
+  const hung = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('hung'), 4000);
+    timer.unref?.();
+  });
+  try {
+    const outcome = await Promise.race([
+      manager._spawnAttempt('127.0.0.1', 45999, null, null, 0, false, { readyTimeoutMs: 10000 })
+        .catch((error) => error),
+      hung,
+    ]);
+    assert.notEqual(outcome, 'hung', 'the startup promise must settle when the poll throws');
+    assert.equal(outcome && outcome.code, 'SPAWN_ERROR');
+    assert.match(outcome.message, /probe exploded/);
+    assert.equal(manager.hasOwnedChild(), false, 'the failed child is detached');
+  } finally {
+    if (timer) clearTimeout(timer);
+    fs.rmSync(executable, { force: true });
+  }
+});

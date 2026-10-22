@@ -101,6 +101,27 @@ const ADOPTION_SETTLE_POLL_MS = 500;      // settle re-probe cadence
 const SPAWN_RACE_SETTLE_MS = 12000;       // Step C catch: sibling proven/present
 const SPAWN_RACE_SETTLE_NO_SIBLING_MS = 2000; // Step C catch: no sibling evidence
 const DISCOVERY_SETTLE_MS = 4000;         // Step A/B: give a booting sibling a moment
+// A DSH-like listener on a port we were about to spawn on is a sibling, not a
+// free port. Wait this long for its launch token (a cold first boot can take
+// longer than the ordinary discovery budget) before surfacing a retryable
+// "another window is starting DSH" error. Never scan past it: spawning on the
+// next port is exactly how one environment ended up with several managed
+// instances when windows started at slightly different times.
+const SHARED_SIBLING_SETTLE_MS = 30000;
+
+// Cross-window launch claim (shared-instance mode). Only the window holding
+// this file may spawn a managed DSH for the environment; every other window
+// waits for that launch and adopts its instance. Without it, N windows that
+// all probe the port before the winner binds each spawn their own child, and
+// a loser can still be booting (or scan forward to a free port) when the
+// winner becomes ready — the live "several managed dsh instances in one
+// environment" bug. The holder rewrites the claim every heartbeat so a
+// crashed/hung holder can be displaced after the stale timeout.
+const LAUNCH_CLAIM_POLL_MS = 500;          // waiter re-probe/re-read cadence
+const LAUNCH_CLAIM_HEARTBEAT_MS = 2000;    // holder liveness refresh
+const LAUNCH_CLAIM_STALE_MS = 15000;       // no heartbeat for this long => displace
+const LAUNCH_CLAIM_MAX_AGE_MS = 10 * 60 * 1000; // absolute safety net
+const SHARED_LAUNCH_WAIT_MS = COLD_HEALTH_TIMEOUT_MS + 15000; // join a sibling's cold boot
 
 // Instance-registry inter-process locking. Every registry mutation is a
 // read-modify-write of the whole JSON file; with N windows activating at once
@@ -440,6 +461,13 @@ class ServerManager {
     this._cancelGeneration = 0; // invalidates an in-flight ensure/spawn operation
     this._lastSpawnPort = null; // last port spawned by THIS instance (fresh origin)
     this._hasEverBeenReady = false; // first successful spawn switches to the warm readiness budget
+    // Cross-window launch claim held by THIS manager while it spawns the
+    // shared-environment instance (see _tryAcquireLaunchClaim). Null whenever
+    // this window is not launching.
+    this._launchClaim = null;
+    this._launchClaimRegistryFile = null;
+    this._launchClaimTimer = null;
+    this._launchClaimLost = false;
   }
 
   /**
@@ -580,7 +608,7 @@ class ServerManager {
   }
 
   _throwIfCancelled(generation) {
-    if (generation !== this._cancelGeneration) {
+    if (generation !== null && generation !== undefined && generation !== this._cancelGeneration) {
       throw new ServerError('DSH lifecycle operation was cancelled');
     }
   }
@@ -689,14 +717,30 @@ class ServerManager {
    *   legacy no-bookkeeping behavior.
    * @param {number} [options.settleMs] - Bounded wait (ms) re-probing until
    *   the endpoint becomes adoptable; 0 = single-shot.
+   * @param {number} [options.probeAttempts] - Probe attempts per settle round;
+   *   defaults to 3 single-shot and 1 while settling (the loop itself repeats
+   *   the probe, and one full retry triple per round made a short settle
+   *   overrun its budget by ~10s on a silent listener).
    * @param {boolean} [options.silent] - Skip the "Probing DSH service" status
    *   emission (used by the mid-wait sibling adoption inside the spawn health
    *   poll, where a re-rendered probing page every few seconds is churn).
+   * @param {number} [options.generation] - ensure/spawn generation; a
+   *   cancellation rejects instead of being swallowed by the settle loop.
    * @returns {Promise<object|null>} RunningServer handle, or null.
    */
-  async adoptRunningDsh(host, port, { registryFile = null, settleMs = 0, silent = false } = {}) {
+  async adoptRunningDsh(host, port, {
+    registryFile = null,
+    settleMs = 0,
+    probeAttempts = null,
+    silent = false,
+    generation = null,
+  } = {}) {
     const deadline = Date.now() + Math.max(0, settleMs);
+    const attempts = Number.isInteger(probeAttempts) && probeAttempts > 0
+      ? probeAttempts
+      : (settleMs > 0 ? 1 : 3);
     for (let round = 0; ; round++) {
+      this._throwIfCancelled(generation);
       try {
         // Refuse an instance of the other OS environment before probing it at
         // all, and re-check on every round: a pre-fix sibling window can write
@@ -714,14 +758,14 @@ class ServerManager {
         if (round === 0 && !silent) {
           this._emit('probing', 'Probing DSH service: http://{host}:{port}…', { host, port });
         }
-        let result = await this.probeWithRetry(host, port);
+        let result = await this.probeWithRetry(host, port, { attempts });
         let token = null;
         if (result && result.reachable && !result.isDsh) {
           // Reachable but not recognized: on dsh 0.1.2+ this is the auth fence
           // answering 401. Retry with the owning window's launch token.
           token = ServerManager._entryLaunchToken(facts.entry);
           if (token) {
-            const withToken = await this.probeWithRetry(host, port, { token });
+            const withToken = await this.probeWithRetry(host, port, { attempts, token });
             if (withToken && withToken.reachable && withToken.isDsh) result = withToken;
             else token = null; // token rejected: do not attach it to the handle
           }
@@ -748,9 +792,14 @@ class ServerManager {
           }
           return handle;
         }
-      } catch {
+      } catch (error) {
+        // A cancelled ensure must propagate, not be swallowed into a null that
+        // the caller cannot distinguish from "not adoptable".
+        if (error && error.name === 'ServerError' && /cancelled/.test(error.message || '')) throw error;
+        this._throwIfCancelled(generation);
         // The caller keeps its original error and decides whether to surface it.
       }
+      this._throwIfCancelled(generation);
       if (Date.now() >= deadline) return null;
       await new Promise((resolve) => setTimeout(resolve, ADOPTION_SETTLE_POLL_MS));
     }
@@ -973,17 +1022,24 @@ class ServerManager {
    *   { reachable: false, reason: 'refused' } — connection refused: port free
    *   { reachable: false, reason: 'timeout' } — listener silent: port busy
    *   { reachable: false, reason: '<code>' }  — other transport failure
+   *
+   * The optional `detail` object is an out-parameter for callers that need the
+   * HTTP status (the shared-mode port scan must tell a fenced DSH's 401 apart
+   * from an unrelated web server's 200) without changing the public result
+   * shape every existing caller and test relies on.
    */
-  async probe(host, port, { token = null } = {}) {
+  async probe(host, port, { token = null, detail = null } = {}) {
     const requestTarget = token
       ? `/?token=${encodeURIComponent(token)}`
       : '/';
     return new Promise((resolve) => {
       let done = false;
       let raw = '';
+      let statusCode = null;
       const finish = (result) => {
         if (!done) {
           done = true;
+          if (detail && typeof detail === 'object') detail.statusCode = statusCode;
           socket.destroy();
           resolve(result);
         }
@@ -1001,9 +1057,10 @@ class ServerManager {
         const remaining = MAX_BODY_BYTES - raw.length;
         if (remaining > 0) raw += chunk.slice(0, remaining);
         const status = /^HTTP\/1\.[01]\s+(\d{3})\b/.exec(raw);
-        if (status && Number(status[1]) === 200 && raw.includes(BOOT_MARKER)) {
+        if (status) statusCode = Number(status[1]);
+        if (status && statusCode === 200 && raw.includes(BOOT_MARKER)) {
           finish({ reachable: true, isDsh: true });
-        } else if (status && Number(status[1]) === 303 && token !== null) {
+        } else if (status && statusCode === 303 && token !== null) {
           // dsh 0.1.2+ auth fence accepting the launch token: the 303 cookie
           // redirect only exists on that path, so it identifies DSH exactly.
           finish({ reachable: true, isDsh: true });
@@ -1013,11 +1070,12 @@ class ServerManager {
       });
       socket.on('end', () => {
         const status = /^HTTP\/1\.[01]\s+(\d{3})\b/.exec(raw);
+        if (status) statusCode = Number(status[1]);
         finish({
           reachable: true,
           isDsh: Boolean(status
-            && (Number(status[1]) === 200 && raw.includes(BOOT_MARKER)
-              || (Number(status[1]) === 303 && token !== null))),
+            && (statusCode === 200 && raw.includes(BOOT_MARKER)
+              || (statusCode === 303 && token !== null))),
         });
       });
       socket.on('timeout', () => finish({ reachable: false, reason: 'timeout' }));
@@ -1039,11 +1097,14 @@ class ServerManager {
    * when DSH is busy (e.g. streaming a reply) and a single probe would time
    * out.
    */
-  async probeWithRetry(host, port, { attempts = 3, delayMs = 400, token = null } = {}) {
+  async probeWithRetry(host, port, { attempts = 3, delayMs = 400, token = null, detail = null } = {}) {
     const n = Math.max(1, attempts); // at least one attempt, even for 0/negative input
     let last = null;
     for (let i = 0; i < n; i++) {
-      last = await this.probe(host, port, token === null ? {} : { token });
+      last = await this.probe(host, port, {
+        ...(token === null ? {} : { token }),
+        ...(detail === null ? {} : { detail }),
+      });
       if (last.reachable) return last;
       if (i < n - 1) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -1113,6 +1174,7 @@ class ServerManager {
     registryFile,
     shareMode = SHARE_MODES.WINDOW,
     discoverDshWebPorts = null,
+    sharedLaunchWaitMs = null,
   } = {}) {
     const generation = this._cancelGeneration;
     if (host !== DEFAULT_HOST) {
@@ -1149,7 +1211,8 @@ class ServerManager {
     this._emit('probing', 'Probing DSH service: http://{host}:{port}…', { host, port });
 
     // Step 2: probe the configured port (with retries against transient busyness).
-    const r = await this.probeWithRetry(host, port);
+    const probeDetail = {};
+    const r = await this.probeWithRetry(host, port, { detail: probeDetail });
     this._throwIfCancelled(generation);
 
     // Shared-instance mode: converge on the one DSH of this OS environment.
@@ -1162,7 +1225,9 @@ class ServerManager {
         registryFile,
         generation,
         probeResult: r,
+        probeDetail,
         discoverDshWebPorts,
+        sharedLaunchWaitMs,
       });
     }
 
@@ -1232,46 +1297,73 @@ class ServerManager {
     registryFile,
     generation,
     probeResult,
+    probeDetail = null,
     discoverDshWebPorts,
+    sharedLaunchWaitMs = null,
   }) {
     this._throwIfCancelled(generation);
 
-    // Step A: adopt whatever answers on the configured port.
+    const managedPorts = this._sharedManagedPorts(registryFile, host);
+    let discoveredPorts = [];
+
+    // Step A: adopt whatever is already known to exist on the configured port.
     //
-    // The gate is `reachable`, NOT `isDsh`: on dsh 0.1.2+ a tokenless probe of
-    // a HEALTHY fenced instance answers 401 and is classified not-DSH, so an
-    // isDsh gate skipped adoption for exactly the instances this mode exists
-    // to share (live bug 2026-09-18: two windows of one WSL environment each
-    // spawned their own DSH, 3081 and 3082). adoptRunningDsh retries the probe
-    // with the launch token recovered from the instance registry and returns
-    // null for a genuinely foreign endpoint, which falls through to Step B/C
-    // unchanged. A bounded settle covers the sibling mid-boot: it answers 401
-    // before its own window has written the registry token, so the first pass
-    // alone cannot adopt it (multi-window simultaneous start).
-    if (probeResult.reachable) {
+    // The gate is NOT `isDsh`: on dsh 0.1.2+ a tokenless probe of a HEALTHY
+    // fenced instance answers 401 and is classified not-DSH, so an isDsh gate
+    // skipped adoption for exactly the instances this mode exists to share
+    // (live bug 2026-09-18: two windows of one WSL environment each spawned
+    // their own DSH, 3081 and 3082). Registry evidence keeps adoption running
+    // even before the listener binds, and a bounded settle covers the sibling
+    // mid-boot: it answers 401 before its own window has written the registry
+    // token, so the first pass alone cannot adopt it.
+    //
+    // The process scan is deliberately NOT run before this direct attempt:
+    // it costs up to 8s on Windows, and the overwhelmingly common case is an
+    // already-running instance answering on the configured port. Discovery is
+    // paid only when direct/registry evidence is absent or adoption fails.
+    const directEvidence = probeResult.isDsh === true
+      || (probeDetail && (probeDetail.statusCode === 401 || probeDetail.statusCode === 303))
+      || probeResult.reason === 'timeout';
+    const configuredEvidence = directEvidence || managedPorts.includes(port);
+    if (configuredEvidence) {
       const adopted = await this.adoptRunningDsh(host, port, {
         registryFile,
         settleMs: DISCOVERY_SETTLE_MS,
+        generation,
       });
       if (adopted) return adopted;
     }
 
-    // Step B: discover this environment's own `dsh web` listeners elsewhere.
-    //
-    // The configured port is NOT skipped unconditionally anymore: when our own
-    // probe found it bound-but-silent (a booting sibling — 'timeout', or
-    // another indeterminate state) and the process scan confirms a dsh on
-    // exactly that port, adoption must be attempted on it too, or the spawn
-    // below scans forward and brings up a duplicate instance (the silent
-    // 3081/3082 shape of the 2026-09-18 race). A plain 'refused' still skips:
-    // nothing is there, spawning is correct.
+    // Discovery is also evidence for the configured port: a booting sibling
+    // is not bound yet (probe 'refused') but its `dsh … --port N` process line
+    // is already visible. Treating "refused" as "nothing there" and spawning
+    // was the duplicate instance path.
     if (autoStart && typeof discoverDshWebPorts === 'function') {
-      for (const candidate of await this._discoverEnvironmentDshPorts(discoverDshWebPorts)) {
-        if (candidate === port && (probeResult.reachable || probeResult.reason === 'refused')) continue;
+      discoveredPorts = await this._discoverEnvironmentDshPorts(discoverDshWebPorts);
+      this._throwIfCancelled(generation);
+      if (!configuredEvidence && discoveredPorts.includes(port)) {
+        const adopted = await this.adoptRunningDsh(host, port, {
+          registryFile,
+          settleMs: DISCOVERY_SETTLE_MS,
+          generation,
+        });
+        if (adopted) return adopted;
+      }
+    }
+
+    // Step B: adopt any other live instance of this environment, whether it
+    // was found by the process scan or is recorded in the registry. This is
+    // what makes a window join an instance that drifted to port+1 instead of
+    // starting a second one on the now-free configured port.
+    if (autoStart) {
+      const candidates = [...new Set([...discoveredPorts, ...managedPorts])]
+        .filter((candidate) => candidate !== port);
+      for (const candidate of candidates) {
         this._throwIfCancelled(generation);
         const adopted = await this.adoptRunningDsh(host, candidate, {
           registryFile,
           settleMs: DISCOVERY_SETTLE_MS,
+          generation,
         });
         if (adopted) return adopted;
       }
@@ -1281,11 +1373,45 @@ class ServerManager {
       throw new ServerError(STARTUP_ERRORS.AUTOSTART_DISABLED.template, {}, 'AUTOSTART_DISABLED');
     }
 
-    // Step C: spawn, then settle a start race with one bounded adoption wait.
-    // The health poll also adopt-checks the configured port every few rounds
-    // (adoptSibling): as soon as a sibling window's instance becomes
-    // adoptable, this window abandons its own duplicate boot and attaches.
+    // Step C: take the environment's launch turn, then spawn. Only the holder
+    // of the launch claim may spawn; every other window waits for this launch
+    // and adopts it. That is the cross-window guarantee behind "one managed
+    // DSH per environment", not merely a best-effort probe race.
     try {
+      if (registryFile) {
+        const waitMs = Number.isFinite(sharedLaunchWaitMs) && sharedLaunchWaitMs >= 0
+          ? sharedLaunchWaitMs
+          : SHARED_LAUNCH_WAIT_MS;
+        const turn = await this._waitForSharedLaunchTurn({
+          host,
+          port,
+          registryFile,
+          generation,
+          waitMs,
+          discoveredPorts,
+        });
+        if (turn.adopted) return turn.adopted;
+      }
+
+      // Re-check after acquiring the claim: a sibling may have finalized
+      // while this window was waiting, and adopting is always better than
+      // spawning. Include the claim's port (published before spawn) so a
+      // sibling that appeared during the wait is found even if the process
+      // scan is unavailable.
+      const claimPort = this._launchClaim && Number.isInteger(this._launchClaim.port)
+        ? this._launchClaim.port
+        : null;
+      const adoptedAfterClaim = await this._adoptSharedSiblingPorts({
+        host,
+        port,
+        registryFile,
+        generation,
+        extraPorts: claimPort === null ? [] : [claimPort],
+        settleMs: 0,
+        probeAttempts: 1,
+      });
+      if (adoptedAfterClaim) return adoptedAfterClaim;
+
       return await this._spawnOnFreePort({
         host,
         port,
@@ -1293,38 +1419,420 @@ class ServerManager {
         registryFile,
         generation,
         probeResult,
-        adoptSibling: () => this.adoptRunningDsh(host, port, { registryFile, silent: true }),
+        // Shared instance: the configured port is canonical. Never skip it
+        // just because THIS manager spawned there before (that fresh-origin
+        // rule is for the legacy per-window mode and made a restarted shared
+        // instance drift to port+1, where the next window could not find it).
+        preferConfiguredPort: true,
+        shared: true,
+        adoptSibling: () => this.adoptRunningDsh(host, port, {
+          registryFile,
+          silent: true,
+          generation,
+        }),
       });
     } catch (spawnError) {
       this._throwIfCancelled(generation);
+      if (spawnError && spawnError.code === 'SHARED_SIBLING_FOUND') {
+        // The scan found a DSH-like listener instead of a free port. Wait for
+        // its launch token and adopt; spawning next to it is the duplicate
+        // instance this path exists to prevent.
+        const siblingPort = spawnError.params && Number.isInteger(spawnError.params.port)
+          ? spawnError.params.port
+          : port;
+        const adopted = await this.adoptRunningDsh(host, siblingPort, {
+          registryFile,
+          settleMs: SHARED_SIBLING_SETTLE_MS,
+          generation,
+        });
+        if (adopted) return adopted;
+        throw new ServerError(
+          STARTUP_ERRORS.SHARED_START_IN_PROGRESS.template,
+          {},
+          'SHARED_START_IN_PROGRESS'
+        );
+      }
       // Settle a simultaneous-start race: the sibling that beat us to the port
       // is bound well before its registry entry (the adoptable token) lands,
       // and its boot can take seconds under N-window startup load. Scale the
       // settle budget by the evidence that a sibling actually exists — a
       // genuine spawn failure (broken runtime, no sibling) must still fail
       // fast instead of idling for the full budget.
-      const postMortem = await this.probe(host, port).catch(() => ({ reachable: false, reason: 'error' }));
-      let siblingOnPort = postMortem.reachable || postMortem.reason !== 'refused';
+      const postMortemDetail = {};
+      const postMortem = await this.probe(host, port, { detail: postMortemDetail })
+        .catch(() => ({ reachable: false, reason: 'error' }));
+      // A plain non-DSH web server on the configured port is not a sibling;
+      // only DSH-like evidence justifies the long sibling settle. Otherwise a
+      // scan-forward spawn failure (e.g. broken runtime) idled 12s for
+      // nothing on every retry.
+      let siblingOnPort = postMortem.isDsh === true
+        || postMortemDetail.statusCode === 401
+        || postMortemDetail.statusCode === 303
+        || postMortem.reason === 'timeout';
+      let postMortemPorts = [];
       if (!siblingOnPort && typeof discoverDshWebPorts === 'function') {
-        const ports = await this._discoverEnvironmentDshPorts(discoverDshWebPorts);
-        siblingOnPort = ports.includes(port);
+        postMortemPorts = await this._discoverEnvironmentDshPorts(discoverDshWebPorts);
+        siblingOnPort = postMortemPorts.includes(port);
       }
       const raced = await this.adoptRunningDsh(host, port, {
         registryFile,
         settleMs: siblingOnPort ? SPAWN_RACE_SETTLE_MS : SPAWN_RACE_SETTLE_NO_SIBLING_MS,
+        generation,
       });
       if (raced) return raced;
-      if (typeof discoverDshWebPorts === 'function') {
-        for (const candidate of await this._discoverEnvironmentDshPorts(discoverDshWebPorts)) {
-          if (candidate === port) continue; // just settled above with the full budget
-          const adopted = await this.adoptRunningDsh(host, candidate, {
-            registryFile,
-            settleMs: DISCOVERY_SETTLE_MS,
-          });
-          if (adopted) return adopted;
-        }
+      const fallbackPorts = [...new Set([
+        ...postMortemPorts,
+        ...this._sharedManagedPorts(registryFile, host),
+      ])];
+      for (const candidate of fallbackPorts) {
+        if (candidate === port) continue; // just settled above with the full budget
+        const adopted = await this.adoptRunningDsh(host, candidate, {
+          registryFile,
+          settleMs: DISCOVERY_SETTLE_MS,
+          generation,
+        });
+        if (adopted) return adopted;
       }
       throw spawnError;
+    } finally {
+      this._releaseLaunchClaim();
+    }
+  }
+
+  /**
+   * Ports of live managed DSH instances of THIS OS environment recorded in the
+   * registry, in registry order. Foreign-environment entries are ignored; a
+   * pre-stamp entry is kept and left to adoptRunningDsh's process observation.
+   */
+  _sharedManagedPorts(registryFile, host) {
+    if (!registryFile) return [];
+    const ports = [];
+    for (const entry of ServerManager._readRegistryRaw(registryFile)) {
+      if (!entry || !Number.isInteger(entry.port) || entry.port < 1 || entry.port > 65535) continue;
+      if (entry.host && entry.host !== host) continue;
+      if (!Number.isInteger(entry.pid) || !ServerManager._isProcessAlive(entry.pid)) continue;
+      const declared = typeof entry.runtimeEnvironment === 'string' && entry.runtimeEnvironment.length > 0
+        ? entry.runtimeEnvironment
+        : 'unknown';
+      if (declared !== 'unknown' && declared !== this.hostEnvironment) continue;
+      if (!ports.includes(entry.port)) ports.push(entry.port);
+    }
+    return ports;
+  }
+
+  /**
+   * Attempt adoption on the configured port plus every other known managed
+   * endpoint (registry and optional extras). One probe per port by default so
+   * wait loops stay responsive; callers that can afford it pass a settle.
+   */
+  async _adoptSharedSiblingPorts({
+    host,
+    port,
+    registryFile,
+    generation,
+    extraPorts = [],
+    settleMs = 0,
+    probeAttempts = 1,
+  }) {
+    const candidates = [...new Set([
+      port,
+      ...extraPorts,
+      ...this._sharedManagedPorts(registryFile, host),
+    ])].filter((candidate) => Number.isInteger(candidate) && candidate > 0 && candidate < 65536);
+    for (const candidate of candidates) {
+      this._throwIfCancelled(generation);
+      const adopted = await this.adoptRunningDsh(host, candidate, {
+        registryFile,
+        settleMs,
+        probeAttempts,
+        generation,
+      });
+      if (adopted) return adopted;
+    }
+    return null;
+  }
+
+  /**
+   * Wait for this environment's shared launch to finish (or take it over when
+   * its holder died). While waiting, keep trying to adopt the instance the
+   * holder is starting. Returns {adopted} or {claim} after acquiring the
+   * launch claim.
+   */
+  async _waitForSharedLaunchTurn({ host, port, registryFile, generation, waitMs, discoveredPorts = [] }) {
+    const deadline = Date.now() + Math.max(0, waitMs);
+    let lastProgressAt = Date.now();
+    for (;;) {
+      this._throwIfCancelled(generation);
+
+      // Probe the port the current holder published before spawning (it can
+      // differ from the configured port when a non-DSH service occupies that).
+      const claimState = ServerManager._readLaunchClaimFile(registryFile);
+      const claimPort = claimState && claimState.claim && Number.isInteger(claimState.claim.port)
+        ? claimState.claim.port
+        : null;
+      const adopted = await this._adoptSharedSiblingPorts({
+        host,
+        port,
+        registryFile,
+        generation,
+        extraPorts: claimPort === null ? discoveredPorts : [...discoveredPorts, claimPort],
+        settleMs: 0,
+        probeAttempts: 1,
+      });
+      if (adopted) return { adopted };
+
+      const claim = this._tryAcquireLaunchClaim(registryFile, { host, port });
+      if (claim) return { claim };
+
+      if (Date.now() >= deadline) {
+        throw new ServerError(
+          STARTUP_ERRORS.SHARED_START_IN_PROGRESS.template,
+          {},
+          'SHARED_START_IN_PROGRESS'
+        );
+      }
+
+      // Keep the waiting user informed: a cold first boot can take a minute,
+      // and a status page stuck on "Probing" looks like the retry hang this
+      // path is supposed to eliminate.
+      if (Date.now() - lastProgressAt >= 5000) {
+        lastProgressAt = Date.now();
+        this._emit('probing', 'Waiting for another VS Code window to finish starting DSH…');
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, LAUNCH_CLAIM_POLL_MS));
+    }
+  }
+
+  /** Path of the shared-environment launch claim next to the instance registry. */
+  static _launchClaimPath(registryFile) {
+    return `${registryFile}.launch`;
+  }
+
+  /**
+   * Read the launch claim as-is. Returns {claim, mtimeMs} or null when the
+   * file is absent. A torn/corrupt file yields {claim: null, mtimeMs} so the
+   * caller can let it age out instead of trusting it.
+   */
+  static _readLaunchClaimFile(registryFile) {
+    if (!registryFile) return null;
+    const claimPath = ServerManager._launchClaimPath(registryFile);
+    let stat;
+    try {
+      stat = fs.statSync(claimPath);
+    } catch {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
+      return {
+        claim: parsed && typeof parsed === 'object' ? parsed : null,
+        mtimeMs: stat.mtimeMs,
+      };
+    } catch (error) {
+      // The holder can release between the stat and the read. That is "no
+      // claim", not a corrupt claim that must age out for 15s.
+      if (error && error.code === 'ENOENT') return null;
+      return { claim: null, mtimeMs: stat.mtimeMs };
+    }
+  }
+
+  /**
+   * Whether a launch claim is no longer trustworthy.
+   *
+   * A claim is stale when its owner extension-host process is gone, when its
+   * heartbeat (rewritten every LAUNCH_CLAIM_HEARTBEAT_MS while the holder is
+   * spawning) has not advanced for LAUNCH_CLAIM_STALE_MS, or when it is older
+   * than the absolute cap. A corrupt file ages out from its mtime. Deliberately
+   * conservative in the other direction: a live, heartbeating holder is never
+   * displaced, so a slow cold boot cannot produce a second spawn.
+   */
+  static _launchClaimIsStale(state, now = Date.now()) {
+    if (!state) return true;
+    const claim = state.claim;
+    if (!claim || typeof claim !== 'object') {
+      return !Number.isFinite(state.mtimeMs) || now - state.mtimeMs > LAUNCH_CLAIM_STALE_MS;
+    }
+    const owner = Number.isInteger(claim.vscodePid) ? claim.vscodePid : claim.pid;
+    if (!Number.isInteger(owner) || owner <= 0) return true;
+    if (owner !== process.pid && !ServerManager._isProcessAlive(owner)) return true;
+    const at = Number.isFinite(claim.at) ? claim.at : state.mtimeMs;
+    const heartbeat = Number.isFinite(claim.heartbeat) ? claim.heartbeat : at;
+    if (Number.isFinite(heartbeat) && now - heartbeat > LAUNCH_CLAIM_STALE_MS) return true;
+    if (Number.isFinite(at) && now - at > LAUNCH_CLAIM_MAX_AGE_MS) return true;
+    return false;
+  }
+
+  /**
+   * Try to become the environment's shared-launch holder.
+   *
+   * Returns a claim object on success, null when another live window holds it.
+   * When the claim file cannot be written at all (read-only storage) the
+   * manager degrades to the old best-effort behavior with a one-shot
+   * diagnostic rather than blocking startup forever.
+   *
+   * @param {string|null} registryFile - Instance registry path.
+   * @param {{host: string, port: number}} endpoint - Configured endpoint.
+   * @returns {object|null} The acquired claim, or null when held by a peer.
+   */
+  _tryAcquireLaunchClaim(registryFile, { host, port }) {
+    if (!registryFile) return null;
+    const claimPath = ServerManager._launchClaimPath(registryFile);
+    let created = null;
+    try {
+      ServerManager._withRegistryLock(registryFile, () => {
+        const existing = ServerManager._readLaunchClaimFile(registryFile);
+        if (existing && !ServerManager._launchClaimIsStale(existing)) {
+          const held = new Error('shared launch claim is held');
+          held.code = 'LAUNCH_CLAIM_HELD';
+          throw held;
+        }
+        if (existing) {
+          try { fs.unlinkSync(claimPath); } catch { /* a peer released it first */ }
+        }
+        const claim = {
+          token: crypto.randomBytes(18).toString('hex'),
+          pid: process.pid,
+          vscodePid: this.ownerVscodePid,
+          windowId: this.ownerWindowId,
+          environment: this.hostEnvironment,
+          host,
+          port: null,
+          at: Date.now(),
+          heartbeat: Date.now(),
+        };
+        fs.mkdirSync(path.dirname(path.resolve(claimPath)), { recursive: true });
+        const temporary = `${claimPath}.${process.pid}.${Date.now()}.tmp`;
+        fs.writeFileSync(temporary, JSON.stringify(claim), { mode: 0o600 });
+        try { fs.chmodSync(temporary, 0o600); } catch { /* non-POSIX */ }
+        try {
+          fs.renameSync(temporary, claimPath);
+        } catch (error) {
+          try { fs.unlinkSync(temporary); } catch { /* already gone */ }
+          throw error;
+        }
+        created = claim;
+      });
+    } catch (error) {
+      if (error && error.code === 'LAUNCH_CLAIM_HELD') return null;
+      this._emit('selfheal', 'Shared launch-claim file is unavailable ({error}); starting without cross-window launch serialization', {
+        error: error && error.message ? error.message : String(error),
+      });
+      return {
+        token: null,
+        pid: process.pid,
+        vscodePid: this.ownerVscodePid,
+        windowId: this.ownerWindowId,
+        environment: this.hostEnvironment,
+        host,
+        port: null,
+        at: Date.now(),
+        heartbeat: Date.now(),
+        persisted: false,
+      };
+    }
+    if (!created) return null;
+    created.persisted = true;
+    this._launchClaim = created;
+    this._launchClaimRegistryFile = registryFile;
+    this._launchClaimLost = false;
+    this._startLaunchClaimHeartbeat();
+    return created;
+  }
+
+  /** Refresh the held claim in the background; stop on loss. */
+  _startLaunchClaimHeartbeat() {
+    this._stopLaunchClaimHeartbeat();
+    if (!this._launchClaim || this._launchClaim.persisted === false) return;
+    this._launchClaimTimer = setInterval(() => this._updateLaunchClaim(), LAUNCH_CLAIM_HEARTBEAT_MS);
+    if (typeof this._launchClaimTimer.unref === 'function') this._launchClaimTimer.unref();
+  }
+
+  _stopLaunchClaimHeartbeat() {
+    if (this._launchClaimTimer !== null) {
+      clearInterval(this._launchClaimTimer);
+      this._launchClaimTimer = null;
+    }
+  }
+
+  /**
+   * Re-publish the held claim (heartbeat + optional facts such as the chosen
+   * port). A claim replaced by another window marks this holder as lost; the
+   * spawn health poll then abandons its child instead of racing the new owner.
+   */
+  _updateLaunchClaim(patch = {}) {
+    const claim = this._launchClaim;
+    if (!claim) return false;
+    Object.assign(claim, patch);
+    if (claim.persisted === false) return true;
+    const registryFile = this._launchClaimRegistryFile;
+    if (!registryFile) return true;
+    let stillOwned = false;
+    try {
+      ServerManager._withRegistryLock(registryFile, () => {
+        const state = ServerManager._readLaunchClaimFile(registryFile);
+        if (!state || !state.claim || state.claim.token !== claim.token) return;
+        stillOwned = true;
+        const next = { ...claim, ...patch, heartbeat: Date.now() };
+        const claimPath = ServerManager._launchClaimPath(registryFile);
+        const temporary = `${claimPath}.${process.pid}.${Date.now()}.tmp`;
+        fs.writeFileSync(temporary, JSON.stringify(next), { mode: 0o600 });
+        try { fs.chmodSync(temporary, 0o600); } catch { /* non-POSIX */ }
+        fs.renameSync(temporary, claimPath);
+        Object.assign(claim, next);
+      });
+    } catch {
+      return false; // transient write failure: keep owning, next heartbeat retries
+    }
+    if (!stillOwned) {
+      this._launchClaimLost = true;
+      this._stopLaunchClaimHeartbeat();
+    }
+    return stillOwned;
+  }
+
+  /** Cheap synchronous ownership check (used before spawn and while polling). */
+  _launchClaimIsOwned() {
+    const claim = this._launchClaim;
+    if (!claim) return true;
+    if (claim.persisted === false) return true;
+    if (!this._launchClaimRegistryFile) return true;
+    const state = ServerManager._readLaunchClaimFile(this._launchClaimRegistryFile);
+    return Boolean(state && state.claim && state.claim.token === claim.token);
+  }
+
+  /** Throw when this window no longer owns the shared-launch claim. */
+  _assertLaunchClaimOwned() {
+    if (!this._launchClaim) return;
+    if (this._launchClaimLost || !this._launchClaimIsOwned()) {
+      this._launchClaimLost = true;
+      this._stopLaunchClaimHeartbeat();
+      throw new ServerError(
+        'This window lost the shared DSH launch claim to another window',
+        {},
+        'SHARED_START_IN_PROGRESS'
+      );
+    }
+  }
+
+  /** Release the held claim if (and only if) it is still ours. */
+  _releaseLaunchClaim() {
+    this._stopLaunchClaimHeartbeat();
+    const claim = this._launchClaim;
+    const registryFile = this._launchClaimRegistryFile;
+    this._launchClaim = null;
+    this._launchClaimRegistryFile = null;
+    this._launchClaimLost = false;
+    if (!claim || claim.persisted === false || !registryFile) return;
+    try {
+      ServerManager._withRegistryLock(registryFile, () => {
+        const state = ServerManager._readLaunchClaimFile(registryFile);
+        if (state && state.claim && state.claim.token === claim.token) {
+          try { fs.unlinkSync(ServerManager._launchClaimPath(registryFile)); } catch { /* already gone */ }
+        }
+      });
+    } catch {
+      // best-effort: a leftover claim becomes stale after the heartbeat timeout
     }
   }
 
@@ -1348,14 +1856,33 @@ class ServerManager {
    * instance, never reuse the last port this instance spawned (fresh origin)
    * so DSH does not cache the previous workspace under the same origin.
    */
-  async _spawnOnFreePort({ host, port, cwd, registryFile, generation, probeResult, adoptSibling = null }) {
+  async _spawnOnFreePort({
+    host,
+    port,
+    cwd,
+    registryFile,
+    generation,
+    probeResult,
+    adoptSibling = null,
+    shared = false,
+    preferConfiguredPort = false,
+  }) {
     const occupied = probeResult.reachable || probeResult.reason !== 'refused';
     let scanStart = occupied ? port + 1 : port;
-    if (this._lastSpawnPort !== null && scanStart <= this._lastSpawnPort) {
+    // Shared mode keeps the configured port canonical: a restart must not skip
+    // it just because this manager spawned there earlier. The legacy
+    // per-window mode intentionally moves to a fresh origin so DSH does not
+    // cache the previous workspace under the same origin.
+    if (!preferConfiguredPort && this._lastSpawnPort !== null && scanStart <= this._lastSpawnPort) {
       scanStart = this._lastSpawnPort + 1;
     }
-    const freePort = await this._findFreePort(host, scanStart);
+    const freePort = await this._findFreePort(host, scanStart, {
+      shared,
+      guardedPort: preferConfiguredPort ? port : null,
+    });
     this._lastSpawnPort = freePort;
+    if (this._launchClaim) this._updateLaunchClaim({ port: freePort });
+    this._assertLaunchClaimOwned();
     this._throwIfCancelled(generation);
     return this._spawnAndWait(host, freePort, cwd, registryFile, generation, { adoptSibling });
   }
@@ -1366,12 +1893,35 @@ class ServerManager {
    * considered free. A timed-out probe means a silent listener may own the
    * port, so it is skipped conservatively instead of risking an EADDRINUSE
    * spawn and a misleading "process exited early" error.
+   *
+   * In shared mode a DSH-like listener (200 + boot marker, the 0.1.2+ auth
+   * fence's 401, or a silent listener on the guarded configured port) is not
+   * "occupied, keep scanning" — it is an instance this window must join.
+   * Throwing SHARED_SIBLING_FOUND lets the caller wait for that instance's
+   * launch token and adopt it. Scanning past it is how one environment ended
+   * up with multiple managed instances.
    */
-  async _findFreePort(host, startPort) {
+  async _findFreePort(host, startPort, { shared = false, guardedPort = null } = {}) {
     for (let i = 0; i < PORT_SCAN_LIMIT; i++) {
       const candidate = startPort + i;
-      const probeResult = await this.probe(host, candidate);
+      const detail = {};
+      const probeResult = await this.probe(host, candidate, { detail });
       if (!probeResult.reachable && probeResult.reason === 'refused') return candidate;
+      if (!shared) continue;
+      const dshLike = probeResult.isDsh === true
+        || detail.statusCode === 401
+        || detail.statusCode === 303;
+      const silentGuardedPort = guardedPort !== null
+        && candidate === guardedPort
+        && !probeResult.reachable
+        && probeResult.reason === 'timeout';
+      if (dshLike || silentGuardedPort) {
+        throw new ServerError(
+          'A DSH instance is already listening at http://{host}:{port}',
+          { host, port: candidate },
+          'SHARED_SIBLING_FOUND'
+        );
+      }
     }
     throw new ServerError(STARTUP_ERRORS.NO_FREE_PORT.template, {
       limit: PORT_SCAN_LIMIT,
@@ -2035,7 +2585,25 @@ class ServerManager {
         : (this._hasEverBeenReady ? HEALTH_TIMEOUT_MS : COLD_HEALTH_TIMEOUT_MS);
       const deadline = Date.now() + readyTimeoutMs;
       let settled = false;
+      let promiseFinished = false;
       let polls = 0;
+      // `settled` means "stop doing more startup work"; `promiseFinished`
+      // means resolve/reject already ran. Keeping them separate lets the poll
+      // wrapper reject a promise that a cleanup path marked settled without
+      // ever resolving — otherwise a throw during cleanup left Retry pending
+      // forever (the exact hang this hardening exists for).
+      const resolveOnce = (value) => {
+        if (promiseFinished) return;
+        promiseFinished = true;
+        settled = true;
+        resolve(value);
+      };
+      const rejectOnce = (error) => {
+        if (promiseFinished) return;
+        promiseFinished = true;
+        settled = true;
+        reject(error);
+      };
 
       // Persistent listener: any exit NOT caused by stop() is unexpected and
       // reported through onStatus (e.g. the service crashed after becoming
@@ -2067,14 +2635,14 @@ class ServerManager {
         if (this._child === child) this._child = null;
         this._ownedServer = null;
         this._emit('error', STARTUP_ERRORS.SPAWN_ERROR.template, { error: err.message, log: logPath });
-        reject(new ServerError(STARTUP_ERRORS.SPAWN_ERROR.template, { error: err.message }, 'SPAWN_ERROR'));
+        rejectOnce(new ServerError(STARTUP_ERRORS.SPAWN_ERROR.template, { error: err.message }, 'SPAWN_ERROR'));
       });
 
       child.once('exit', (code, signal) => {
         if (settled) return;
         settled = true;
         if (this._stopping) {
-          reject(new ServerError('DSH process was stopped'));
+          rejectOnce(new ServerError('DSH process was stopped'));
           return;
         }
         const error = new ServerError(STARTUP_ERRORS.SPAWN_EXITED_EARLY.template, {
@@ -2085,17 +2653,42 @@ class ServerManager {
           // surface its tail instead of a bare exit code.
           excerpt: excerptSuffix(this._readLastSpawnLogTail()),
         }, 'SPAWN_EXITED_EARLY');
-        reject(error);
+        rejectOnce(error);
       });
 
+      // Any unexpected throw inside the async poll must reject this promise.
+      // A bare `poll()` whose async body rejected used to leave the startup
+      // promise pending forever — exactly the "Retry hangs" shape.
+      const failStartup = async (error) => {
+        if (promiseFinished) return;
+        settled = true;
+        if (this._child === child) this._child = null;
+        this._ownedServer = null;
+        child.removeListener('exit', onUnexpectedExit);
+        try { await this._killChild(child); } catch { /* best-effort */ }
+        rejectOnce(error instanceof ServerError ? error : new ServerError(
+          STARTUP_ERRORS.SPAWN_ERROR.template,
+          { error: error && error.message ? error.message : String(error) },
+          'SPAWN_ERROR'
+        ));
+      };
+
       const poll = async () => {
+        try {
+          await pollOnce();
+        } catch (error) {
+          await failStartup(error);
+        }
+      };
+
+      const pollOnce = async () => {
         if (settled) return;
         if (generation !== this._cancelGeneration) {
           settled = true;
           if (this._child === child) this._child = null;
           child.removeListener('exit', onUnexpectedExit);
           await this._killChild(child);
-          reject(new ServerError('DSH lifecycle operation was cancelled'));
+          rejectOnce(new ServerError('DSH lifecycle operation was cancelled'));
           return;
         }
         // Post-spawn environment verification (non-Windows hosts only — the
@@ -2114,7 +2707,7 @@ class ServerManager {
           this._ownedServer = null;
           child.removeListener('exit', onUnexpectedExit);
           await this._killChild(child);
-          reject(new ServerError(
+          rejectOnce(new ServerError(
             STARTUP_ERRORS.RUNTIME_FOREIGN_ENVIRONMENT.template,
             { path: launch.command, host: hostEnvironmentLabel() },
             'RUNTIME_FOREIGN_ENVIRONMENT'
@@ -2126,10 +2719,32 @@ class ServerManager {
         const token = this._extractLaunchToken();
         const probeResult = await this.probe(host, port, token === null ? {} : { token });
         if (settled) return;
+        // stop()/cancelPending() may have detached this child while the probe
+        // was in flight. Never publish a ready handle for it afterwards.
+        if (this._child !== child || this._stopping) {
+          settled = true;
+          rejectOnce(new ServerError('DSH process was stopped'));
+          return;
+        }
 
         if (probeResult.reachable && probeResult.isDsh) {
+          // Last claim check before publishing a ready shared instance: if
+          // another window displaced this (stalled) holder while the child
+          // was booting, adopting the duplicate now would defeat the claim.
+          if (this._launchClaim && (this._launchClaimLost || !this._launchClaimIsOwned())) {
+            this._launchClaimLost = true;
+            await failStartup(new ServerError(
+              'Another VS Code window took over the shared DSH launch',
+              {},
+              'SHARED_START_IN_PROGRESS'
+            ));
+            return;
+          }
+          // Build the ready handle BEFORE marking settled: a throw here must
+          // reach the poll wrapper and reject, not strand the promise.
+          const server = this._finalizeReady(host, port, cwd, child.pid, registryFile, logPath, token);
           settled = true;
-          resolve(this._finalizeReady(host, port, cwd, child.pid, registryFile, logPath, token));
+          resolveOnce(server);
           return;
         }
 
@@ -2142,6 +2757,22 @@ class ServerManager {
         // their full readiness budget on a child that must die of
         // EADDRINUSE anyway.
         polls += 1;
+        // A stolen/replaced launch claim means another window now owns this
+        // environment's launch. Abandon our duplicate boot instead of racing
+        // it; a window only loses the claim after its heartbeat stopped, so
+        // this is the crash/stall recovery path (never the normal path).
+        if (this._launchClaim && (
+          this._launchClaimLost
+          || (polls % 5 === 0 && !this._launchClaimIsOwned())
+        )) {
+          this._launchClaimLost = true;
+          await failStartup(new ServerError(
+            'Another VS Code window took over the shared DSH launch',
+            {},
+            'SHARED_START_IN_PROGRESS'
+          ));
+          return;
+        }
         if (
           typeof options.adoptSibling === 'function'
           && polls % SIBLING_ADOPT_POLL_ROUNDS === 0
@@ -2156,7 +2787,7 @@ class ServerManager {
               this._ownedServer = null;
               child.removeListener('exit', onUnexpectedExit);
               await this._killChild(child); // abandon our duplicate boot
-              resolve(adopted);
+              resolveOnce(adopted);
               return;
             }
           } catch {
@@ -2176,7 +2807,7 @@ class ServerManager {
           // classifies the port as occupied, and drifts the replacement spawn
           // one port up (field logs: 3080 → 3081 → 3082 retry chains).
           await this._waitForPortRefused(host, port, PORT_RELEASE_WAIT_MS);
-          reject(new ServerError(
+          rejectOnce(new ServerError(
             STARTUP_ERRORS.HEALTH_TIMEOUT.template,
             { seconds: readyTimeoutMs / 1000, pid: child.pid },
             'HEALTH_TIMEOUT'
@@ -2314,6 +2945,9 @@ class ServerManager {
   }
 
   async stop() {
+    // A stop during startup must not leave the environment's launch claim
+    // behind: every sibling window would wait for a launch that is over.
+    this._releaseLaunchClaim();
     this._emit('stopping', 'Stopping DSH process…');
     this._stopping = true;
 

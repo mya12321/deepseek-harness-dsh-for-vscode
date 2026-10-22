@@ -2293,3 +2293,72 @@ test('deactivate leaves an owned child running while another window adopts it', 
   await deactivate();
   assert.deepStrictEqual(stopCalls, ['stop'], 'no adopter → the owned child is stopped as before');
 });
+
+test('connect binds to the workspace that is current after a slow server start', async () => {
+  const fake = createFakeVscode({ autoStart: true });
+  const oldRoot = { uri: { fsPath: 'D:\\old-root' }, name: 'old-root', index: 0 };
+  const newRoot = { uri: { fsPath: 'D:\\new-root' }, name: 'new-root', index: 0 };
+  fake.api.workspace.workspaceFolders = [oldRoot];
+  const context = {
+    globalStorageUri: { fsPath: path.join(os.tmpdir(), `dsh-extension-test-late-cwd-${process.pid}`) },
+    subscriptions: [],
+  };
+  const bindingCalls = [];
+  const bindingState = {
+    state: 'bound',
+    cwd: null,
+    workspaceId: 'w-new',
+    sessionId: 'sid-new',
+    owned: true,
+    error: null,
+    at: 0,
+  };
+  const fakeBinding = {
+    async resolve(server, cwd) {
+      bindingCalls.push({ server, cwd });
+      bindingState.cwd = cwd;
+      return 'sid-new';
+    },
+    async refresh() { return 'sid-new'; },
+    dispose() {},
+    state() { return bindingState; },
+  };
+  let ensureServerCwd = null;
+  const manager = {
+    setResolvedRuntime() {},
+    ensureServer(options) {
+      ensureServerCwd = options.cwd;
+      // Simulate the user switching folders while a cold DSH boot is still in
+      // progress: the bind must follow the NEW root, not the spawn-time one.
+      fake.api.workspace.workspaceFolders = [newRoot];
+      return Promise.resolve({
+        url: `http://${options.host}:${options.port}`,
+        host: options.host,
+        port: options.port,
+        pid: 4242,
+        owned: true,
+      });
+    },
+    hasOwnedChild() { return true; },
+    cancelPending() {},
+    async stop() {},
+  };
+
+  await activateWithDependencies(context, {
+    vscode: fake.api,
+    async startTextDocumentBridge() { return { env: {}, async close() {} }; },
+    async startVersionedBridge() { return { env: {}, async close() {} }; },
+    createServerManager() { return manager; },
+    createWorkspaceBinding() { return fakeBinding; },
+    async ensureManagedRuntime() { return {}; },
+  });
+
+  await waitFor(() => bindingCalls.length >= 1);
+  assert.strictEqual(ensureServerCwd, 'D:\\old-root',
+    'the child spawn cwd is the root current at spawn time');
+  assert.strictEqual(bindingCalls[0].cwd, 'D:\\new-root',
+    'the workspace bind must use the root current after the server wait');
+  assert.strictEqual(bindingCalls[0].server.pid, 4242);
+
+  await deactivate();
+});

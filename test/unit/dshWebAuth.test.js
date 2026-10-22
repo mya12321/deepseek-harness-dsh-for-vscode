@@ -6,6 +6,7 @@ const test = require('node:test');
 const {
   cookiePairFromSetCookie,
   createAuthedFetch,
+  mintCookiePair,
   originOfInput,
   tokenFromUrl,
 } = require('../../src/dshWebAuth');
@@ -109,4 +110,64 @@ test('createAuthedFetch caches a failed exchange briefly instead of hammering', 
   now = 31 * 1000;                              // failure TTL expires
   await fetch('http://127.0.0.1:3080/api/z');
   assert.strictEqual(exchangeCount, 2);
+});
+
+test('createAuthedFetch bounds a stalled DSH API request with DSH_API_TIMEOUT', async () => {
+  const inner = (input, init) => new Promise((resolve, reject) => {
+    const signal = init && init.signal;
+    const abort = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (!signal) return; // never settles on its own
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+  const fetch = createAuthedFetch({ fetchImpl: inner, tokenProvider: () => null, timeoutMs: 25 });
+  await assert.rejects(
+    fetch('http://127.0.0.1:9/api/session/list'),
+    (error) => error && error.code === 'DSH_API_TIMEOUT' && /25ms/.test(error.message)
+  );
+});
+
+test('createAuthedFetch propagates a caller abort unchanged', async () => {
+  const inner = (input, init) => new Promise((resolve, reject) => {
+    const abort = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (init.signal.aborted) abort();
+    else init.signal.addEventListener('abort', abort, { once: true });
+  });
+  const fetch = createAuthedFetch({ fetchImpl: inner, tokenProvider: () => null, timeoutMs: 1000 });
+  const controller = new AbortController();
+  const pending = fetch('http://127.0.0.1:9/api/x', { signal: controller.signal });
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(pending, (error) => error && error.name === 'AbortError');
+});
+
+test('createAuthedFetch bounds a stalled response body, not just the headers', async () => {
+  const inner = async (input, init) => ({
+    status: 200,
+    headers: { get: () => null },
+    text: () => new Promise((resolve, reject) => {
+      const abort = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      if (init.signal.aborted) abort();
+      else init.signal.addEventListener('abort', abort, { once: true });
+    }),
+  });
+  const fetch = createAuthedFetch({ fetchImpl: inner, tokenProvider: () => null, timeoutMs: 25 });
+  const response = await fetch('http://127.0.0.1:9/api/x');
+  await assert.rejects(response.text(), (error) => error.code === 'DSH_API_TIMEOUT');
+});
+
+test('mintCookiePair gives up on a stalled token exchange', async () => {
+  const startedAt = Date.now();
+  const inner = (input, init) => new Promise((resolve, reject) => {
+    const abort = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (init.signal.aborted) abort();
+    else init.signal.addEventListener('abort', abort, { once: true });
+  });
+  const cookie = await mintCookiePair({
+    origin: 'http://127.0.0.1:9',
+    token: 't',
+    fetchImpl: inner,
+    timeoutMs: 25,
+  });
+  assert.strictEqual(cookie, null);
+  assert.ok(Date.now() - startedAt < 2000, 'the exchange must not hang the request');
 });

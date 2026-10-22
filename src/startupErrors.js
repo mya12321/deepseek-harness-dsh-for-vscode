@@ -90,6 +90,11 @@ const STARTUP_ERRORS = Object.freeze({
     template: 'DSH service did not become ready within {seconds}s; process terminated (pid={pid})',
     diagnoseHint: 'Inspect the DSH log, then restart DSH or retry.',
   }),
+  SHARED_START_IN_PROGRESS: Object.freeze({
+    retryable: true,
+    template: 'Another VS Code window is already starting DSH in this environment; retry in a moment',
+    diagnoseHint: 'Wait for the other VS Code window to finish starting DSH, then retry.',
+  }),
   BRIDGE_INIT_TIMEOUT: Object.freeze({
     retryable: true,
     template: 'VS Code bridge initialization timed out',
