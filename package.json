@@ -1,9 +1,9 @@
 {
-	"name": "dsh-vs-sidebar",
+	"name": "dsh-integration",
 	"displayName": "%dsh.displayName%",
 	"description": "%dsh.ext.description%",
 	"version": "1.2.1",
-	"publisher": "Xizhi1024",
+	"publisher": "andymiao",
 	"license": "MIT",
 	"pricing": "Free",
 	"repository": {
